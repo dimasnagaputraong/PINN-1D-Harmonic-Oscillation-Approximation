@@ -131,7 +131,7 @@ class PINN(nn.Module):
         self.omega2.data.clamp_(min=0)
         self.omega3.data.clamp_(min=0)
 
-EPOCHS = 10000
+EPOCHS = 15000
 
 # Define the initial and target learning rates
 initial_lr = 1e-2
@@ -152,9 +152,10 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=update_interval
 MSE_LOSS = nn.MSELoss()
 
 #Assign different weight for loss function
-Weight_PDE = 1e-4
+Weight_PDE = 1e-1
 Weight_MSE = 1
-Weight_Velocity = 1e-4
+Weight_Velocity = 1
+Weight_IC = 0
 
 PDE_POINTS = 400
 
@@ -198,6 +199,7 @@ pde_loss_history = []
 ground_truth_loss1_history = []
 ground_truth_loss2_history = []
 velocity_truth_loss_history = []
+ic_loss_history = []
 overall_loss_history = []
 
 model.train()
@@ -205,25 +207,57 @@ model.train()
 for epoch in range(EPOCHS):
     optimizer.zero_grad()
 
+    # Time tensor for the training step
     t = torch.linspace(0, 3, 300, requires_grad=True).view(-1, 1).to(DEVICE)
 
+    # Define the initial conditions
+    initial_t = torch.tensor([0.0], requires_grad=True).to(DEVICE)
+    initial_v1 = torch.tensor([10.0], requires_grad=False).to(DEVICE)
+    initial_v2 = torch.tensor([-10.0], requires_grad=False).to(DEVICE)
+
+    # Compute PDE loss
     pde_loss = PDE_loss(2)
 
+    # Model prediction for all time steps
     y_pred = model(t)
     y1_pred = y_pred[:, 0].view(-1, 1)
     y2_pred = y_pred[:, 1].view(-1, 1)
+
+    # Compute derivatives
     v1_pred = derivative(y1_pred, t)
     v2_pred = derivative(y2_pred, t)
 
-    ground_truth_loss1 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 0].view(-1, 1), y1_ground_truth.to(DEVICE).view(-1, 1))
-    ground_truth_loss2 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 1].view(-1, 1), y2_ground_truth.to(DEVICE).view(-1, 1))
-    velocity_loss = MSE_LOSS(v1_pred, v1_ground_truth.to(DEVICE).view(-1, 1)) + MSE_LOSS(v2_pred, v2_ground_truth.to(DEVICE).view(-1, 1))
+    # Compute ground truth loss
+    ground_truth_loss1 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 0].view(-1, 1),
+                                  y1_ground_truth.to(DEVICE).view(-1, 1))
+    ground_truth_loss2 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 1].view(-1, 1),
+                                  y2_ground_truth.to(DEVICE).view(-1, 1))
 
-    loss = (Weight_MSE) * (ground_truth_loss1 + ground_truth_loss2)\
-           + (Weight_PDE) * pde_loss\
-           + (Weight_Velocity) * velocity_loss
+    # Compute velocity loss
+    velocity_loss = MSE_LOSS(v1_pred, v1_ground_truth.to(DEVICE).view(-1, 1)) + MSE_LOSS(v2_pred, v2_ground_truth.to(
+        DEVICE).view(-1, 1))
+
+    # Initial conditions loss
+    initial_y_pred = model(initial_t.view(-1, 1))
+
+    # Ensure the initial_y_pred has the correct shape
+    if initial_y_pred.dim() == 1:
+        initial_y_pred = initial_y_pred.view(-1, 1)
+
+    initial_v1_pred = derivative(initial_y_pred[:, 0].view(-1, 1), initial_t)
+    initial_v2_pred = derivative(initial_y_pred[:, 1].view(-1, 1), initial_t)
+
+    initial_conditions_loss = MSE_LOSS(initial_v1_pred, initial_v1.view(-1, 1)) + MSE_LOSS(initial_v2_pred,
+                                                                                           initial_v2.view(-1, 1))
 
 
+    # Total loss
+    loss = (Weight_MSE) * (ground_truth_loss1 + ground_truth_loss2) \
+           + (Weight_PDE) * pde_loss \
+           + (Weight_Velocity) * velocity_loss \
+           + (Weight_IC) * initial_conditions_loss  # Add initial conditions loss
+
+    # Backward pass
     loss.backward()
     optimizer.step()
     scheduler.step()
@@ -236,18 +270,19 @@ for epoch in range(EPOCHS):
     ground_truth_loss1_history.append(ground_truth_loss1.item())
     ground_truth_loss2_history.append(ground_truth_loss2.item())
     velocity_truth_loss_history.append(velocity_loss.item())
+    ic_loss_history.append(initial_conditions_loss.item())
     overall_loss_history.append(loss.item())
 
-
+    # Print the loss values and learned parameters every 1000 epochs
     if (epoch + 1) % 1000 == 0:
-        print(f"Epoch: {epoch + 1}\tOverall Loss: {loss.item()}\tPDE Loss: {(1) * pde_loss.item()}\tGround Truth Loss1: {(Weight_MSE) * ground_truth_loss1.item()}"
-              f"\tGround Truth Loss2: {ground_truth_loss2.item()}\tVelocity Loss: {velocity_loss.item()}\tLearned d1: {model.mu1.item():.4f}\tLearned k1: {model.omega1.item():.4f}"
-              f"\tLearned d2: {model.mu2.item():.4f}\tLearned k2: {model.omega2.item():.4f}"
-              f"\tLearned d3: {model.mu3.item():.4f}\tLearned k3: {model.omega3.item():.4f}")
+        print(
+            f"Epoch: {epoch + 1}\tOverall Loss: {loss.item()}\tPDE Loss: {(1) * pde_loss.item()}\tGround Truth Loss1: {(Weight_MSE) * ground_truth_loss1.item()}"
+            f"\tGround Truth Loss2: {ground_truth_loss2.item()}\tVelocity Loss: {(Weight_Velocity) *velocity_loss.item()}\tInitial Conditions Loss: {initial_conditions_loss.item()}"
+            f"\tLearned d1: {model.mu1.item():.4f}\tLearned k1: {model.omega1.item():.4f}"
+            f"\tLearned d2: {model.mu2.item():.4f}\tLearned k2: {model.omega2.item():.4f}"
+            f"\tLearned d3: {model.mu3.item():.4f}\tLearned k3: {model.omega3.item():.4f}")
         # Print the current learning rate every 1000 epochs
         print("Current Learning Rate:", optimizer.param_groups[0]['lr'])
-
-
 
 #model.eval()
 #torch.save(model, 'PINN_EDAG_DN_2.pkl')
@@ -258,6 +293,7 @@ for epoch in range(EPOCHS):
 plt.figure(figsize=(10, 6))
 plt.plot(pde_loss_history, label='PDE Loss')
 plt.plot(velocity_truth_loss_history, label='Velocity Loss')
+plt.plot(ic_loss_history, label='IC Loss')
 plt.plot(ground_truth_loss1_history, label='Ground Truth Loss 1')
 plt.plot(ground_truth_loss2_history, label='Ground Truth Loss 2')
 plt.plot(overall_loss_history, label='Overall Loss', linestyle='--')
@@ -310,17 +346,17 @@ y1_ground_truth = torch.tensor(u1_t[0:300:2], dtype=torch.float32)
 y2_ground_truth = torch.tensor(u2_t[0:300:2], dtype=torch.float32)
 
 plt.plot(t, u1_t, color='tab:orange', linestyle='--', label='x1')
-plt.plot(t, u2_t, color='tab:green', linestyle='--', label='x2')
-plt.plot(t, u1_model, label='x1 from model predicted parameter')
-plt.plot(t, u2_model, label='x2 from model predicted parameter')
+plt.plot(t, u2_t, color='tab:blue', linestyle='--', label='x2')
+plt.plot(t, u1_model, color='tab:orange', label='x1 from model predicted parameter')
+plt.plot(t, u2_model, color='tab:blue', label='x2 from model predicted parameter')
 plt.title(f'Final Prediction -- Learned d1: {model.mu1.item():.4f} -- Learned k1: {model.omega1.item():.4f} -- Learned d2: {model.mu2.item():.4f} -- Learned k2:{model.omega2.item():.4f}-- Learned d3: {model.mu3.item():.4f} -- Learned k3:{model.omega3.item():.4f}')
 plt.legend(['Ground Truth x1', 'Ground Truth x2', 'x1 from model predicted parameter', 'x2 from model predicted parameter'])
 plt.show()
 
 plt.plot(t, v1_t, color='tab:orange', linestyle='--', label='v1')
-plt.plot(t, v2_t, color='tab:green', linestyle='--', label='v2')
-plt.plot(t, v1_model, label='v1 from model predicted parameter')
-plt.plot(t, v2_model, label='v2 from model predicted parameter')
+plt.plot(t, v2_t, color='tab:blue', linestyle='--', label='v2')
+plt.plot(t, v1_model, color='tab:orange', label='v1 from model predicted parameter')
+plt.plot(t, v2_model, color='tab:blue', label='v2 from model predicted parameter')
 plt.title(f'Final Prediction -- Learned d1: {model.mu1.item():.4f} -- Learned k1: {model.omega1.item():.4f} -- Learned d2: {model.mu2.item():.4f} -- Learned k2:{model.omega2.item():.4f}-- Learned d3: {model.mu3.item():.4f} -- Learned k3:{model.omega3.item():.4f}')
 plt.legend(['Ground Truth v1', 'Ground Truth v2', 'v1 from model predicted parameter', 'v2 from model predicted parameter'])
 plt.show()
