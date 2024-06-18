@@ -1,11 +1,26 @@
+import time
+
+import numpy as np
 import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
-import numpy as np
 from scipy.linalg import expm
 from torch.utils.data import DataLoader, TensorDataset
+import pynvml
 
 #plt.style.use('dark_background')
+
+# Initialize NVML
+pynvml.nvmlInit()
+device_index = 0  # Change this if you have multiple GPUs
+handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+
+# Function to safely convert a tensor to numpy array
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().numpy() if x.requires_grad else x.numpy()
+    return x
 
 def derivative(outputs, inputs):
     return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
@@ -83,18 +98,25 @@ t = np.linspace(0, 3, 300)
 u1_t, u2_t, v1_t, v2_t = solve_spring_mass_damper_eigenvalue(m1, m2, k1, k2, k3, d1, d2, d3, t)
 
 # Sampled ground truth data
-x_ground_truth = torch.tensor(t[0:300:2], dtype=torch.float32)
-y1_ground_truth = torch.tensor(u1_t[0:300:2], dtype=torch.float32)
-y2_ground_truth = torch.tensor(u2_t[0:300:2], dtype=torch.float32)
-v1_ground_truth = torch.tensor(v1_t[0:300:1], dtype=torch.float32)
-v2_ground_truth = torch.tensor(v2_t[0:300:1], dtype=torch.float32)
+x_ground_truth = torch.tensor(t[0:300:2], dtype=torch.float32, device=torch.device("cpu"))
+y1_ground_truth = torch.tensor(u1_t[0:300:2], dtype=torch.float32, device=torch.device("cpu"))
+y2_ground_truth = torch.tensor(u2_t[0:300:2], dtype=torch.float32, device=torch.device("cpu"))
+v1_ground_truth = torch.tensor(v1_t[0:300:2], dtype=torch.float32, device=torch.device("cpu"))
+v2_ground_truth = torch.tensor(v2_t[0:300:2], dtype=torch.float32, device=torch.device("cpu"))
 
-plt.plot(t, u1_t, label='u1(t)')
-plt.plot(t, u2_t, label='u2(t)')
-plt.plot(x_ground_truth, y1_ground_truth, 'o')
-plt.plot(x_ground_truth, y2_ground_truth, 'o')
-plt.legend(['Ground Truth u1', 'Ground Truth u2', 'Sampled Data u1', 'Sampled Data u2'])
-plt.show()
+# create DataLoader, then take one batch
+loader = DataLoader(list(zip(x_ground_truth,y1_ground_truth,y2_ground_truth, v1_ground_truth, v2_ground_truth)), shuffle=True, batch_size=5000, pin_memory=False)
+
+
+
+#plt.plot(t, u1_t, label='u1(t)')
+#plt.plot(t, u2_t, label='u2(t)')
+#plt.plot(x_ground_truth, y1_ground_truth, 'o')
+#plt.plot(x_ground_truth, y2_ground_truth, 'o')
+#plt.legend(['Ground Truth u1', 'Ground Truth u2', 'Sampled Data u1', 'Sampled Data u2'])
+#plt.show()
+
+
 
 class PINN(nn.Module):
     def __init__(self):
@@ -106,7 +128,7 @@ class PINN(nn.Module):
         self.omega2 = nn.Parameter(torch.tensor([1.0]))
         self.omega3 = nn.Parameter(torch.tensor([1.0]))
         self.model = nn.Sequential(
-            nn.Linear(1, 128),
+            nn.Linear(1, 1028),
             nn.Sigmoid(),
             nn.Linear(128, 128),
             nn.Sigmoid(),
@@ -131,7 +153,8 @@ class PINN(nn.Module):
         self.omega2.data.clamp_(min=0)
         self.omega3.data.clamp_(min=0)
 
-EPOCHS = 15000
+EPOCHS = 5000
+gpu_utilizations = []
 
 # Define the initial and target learning rates
 initial_lr = 1e-2
@@ -143,7 +166,9 @@ update_interval = 5000
 # Calculate the gamma value for the scheduler
 gamma = (target_lr / initial_lr) ** (1 / (20000 / update_interval))
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+#DEVICE = "cpu"
+DEVICE = torch.device("cuda")
+print(DEVICE)
 
 #model = torch.load('PINN_EDAG_DN.pkl')
 model = PINN().to(DEVICE)
@@ -152,12 +177,12 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=update_interval
 MSE_LOSS = nn.MSELoss()
 
 #Assign different weight for loss function
-Weight_PDE = 1e-1
+Weight_PDE = 1
 Weight_MSE = 1
-Weight_Velocity = 1
-Weight_IC = 0
+Weight_Velocity = 0
+Weight_IC = 1
 
-PDE_POINTS = 400
+PDE_POINTS = 500
 
 def PDE_loss(n):
 
@@ -165,7 +190,7 @@ def PDE_loss(n):
     omega = [getattr(model, f'omega{i}') for i in range(1, n + 2)]
     m = [1.0, 1.0]
 
-    t = torch.linspace(0, 3, PDE_POINTS, requires_grad=True).view(-1, 1).to(DEVICE)
+    t = torch.linspace(0, 3, PDE_POINTS, requires_grad=True, device=torch.device(DEVICE)).view(-1, 1)
     x = model(t)
     x = [x[:, i].view(-1, 1) for i in range(n)]
 
@@ -202,87 +227,120 @@ velocity_truth_loss_history = []
 ic_loss_history = []
 overall_loss_history = []
 
+start = time.time()
+
 model.train()
 
 for epoch in range(EPOCHS):
-    optimizer.zero_grad()
-
-    # Time tensor for the training step
-    t = torch.linspace(0, 3, 300, requires_grad=True).view(-1, 1).to(DEVICE)
-
-    # Define the initial conditions
-    initial_t = torch.tensor([0.0], requires_grad=True).to(DEVICE)
-    initial_v1 = torch.tensor([10.0], requires_grad=False).to(DEVICE)
-    initial_v2 = torch.tensor([-10.0], requires_grad=False).to(DEVICE)
-
-    # Compute PDE loss
-    pde_loss = PDE_loss(2)
-
-    # Model prediction for all time steps
-    y_pred = model(t)
-    y1_pred = y_pred[:, 0].view(-1, 1)
-    y2_pred = y_pred[:, 1].view(-1, 1)
-
-    # Compute derivatives
-    v1_pred = derivative(y1_pred, t)
-    v2_pred = derivative(y2_pred, t)
-
-    # Compute ground truth loss
-    ground_truth_loss1 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 0].view(-1, 1),
-                                  y1_ground_truth.to(DEVICE).view(-1, 1))
-    ground_truth_loss2 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 1].view(-1, 1),
-                                  y2_ground_truth.to(DEVICE).view(-1, 1))
-
-    # Compute velocity loss
-    velocity_loss = MSE_LOSS(v1_pred, v1_ground_truth.to(DEVICE).view(-1, 1)) + MSE_LOSS(v2_pred, v2_ground_truth.to(
-        DEVICE).view(-1, 1))
-
-    # Initial conditions loss
-    initial_y_pred = model(initial_t.view(-1, 1))
-
-    # Ensure the initial_y_pred has the correct shape
-    if initial_y_pred.dim() == 1:
-        initial_y_pred = initial_y_pred.view(-1, 1)
-
-    initial_v1_pred = derivative(initial_y_pred[:, 0].view(-1, 1), initial_t)
-    initial_v2_pred = derivative(initial_y_pred[:, 1].view(-1, 1), initial_t)
-
-    initial_conditions_loss = MSE_LOSS(initial_v1_pred, initial_v1.view(-1, 1)) + MSE_LOSS(initial_v2_pred,
-                                                                                           initial_v2.view(-1, 1))
+    for x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth in loader:
+        x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth = \
+            x_ground_truth.to(DEVICE), y1_ground_truth.to(DEVICE), y2_ground_truth.to(DEVICE), v1_ground_truth.to(DEVICE), v2_ground_truth.to(DEVICE)
 
 
-    # Total loss
-    loss = (Weight_MSE) * (ground_truth_loss1 + ground_truth_loss2) \
-           + (Weight_PDE) * pde_loss \
-           + (Weight_Velocity) * velocity_loss \
-           + (Weight_IC) * initial_conditions_loss  # Add initial conditions loss
+        if epoch % 1000 == 0:
+            Weight_MSE = max(1e-4, Weight_MSE / 2)
 
-    # Backward pass
-    loss.backward()
-    optimizer.step()
-    scheduler.step()
 
-    # Enforce non-negativity of parameters
-    model.enforce_non_negative()
 
-    # Store the loss values
-    pde_loss_history.append(pde_loss.item())
-    ground_truth_loss1_history.append(ground_truth_loss1.item())
-    ground_truth_loss2_history.append(ground_truth_loss2.item())
-    velocity_truth_loss_history.append(velocity_loss.item())
-    ic_loss_history.append(initial_conditions_loss.item())
-    overall_loss_history.append(loss.item())
+        # Time tensor for the training step
+        t = torch.linspace(0, 3, 300, requires_grad=True).view(-1, 1).to(DEVICE)
 
-    # Print the loss values and learned parameters every 1000 epochs
-    if (epoch + 1) % 1000 == 0:
-        print(
-            f"Epoch: {epoch + 1}\tOverall Loss: {loss.item()}\tPDE Loss: {(1) * pde_loss.item()}\tGround Truth Loss1: {(Weight_MSE) * ground_truth_loss1.item()}"
-            f"\tGround Truth Loss2: {ground_truth_loss2.item()}\tVelocity Loss: {(Weight_Velocity) *velocity_loss.item()}\tInitial Conditions Loss: {initial_conditions_loss.item()}"
-            f"\tLearned d1: {model.mu1.item():.4f}\tLearned k1: {model.omega1.item():.4f}"
-            f"\tLearned d2: {model.mu2.item():.4f}\tLearned k2: {model.omega2.item():.4f}"
-            f"\tLearned d3: {model.mu3.item():.4f}\tLearned k3: {model.omega3.item():.4f}")
-        # Print the current learning rate every 1000 epochs
-        print("Current Learning Rate:", optimizer.param_groups[0]['lr'])
+        # Define the initial conditions
+        initial_t = torch.tensor([0.0], requires_grad=True).to(DEVICE)
+        initial_v1 = torch.tensor([10.0], requires_grad=True).to(DEVICE)
+        initial_v2 = torch.tensor([-10.0], requires_grad=True).to(DEVICE)
+        initial_u1 = torch.tensor([0.0], requires_grad=True).to(DEVICE)
+        initial_u2 = torch.tensor([0.0], requires_grad=True).to(DEVICE)
+
+        # Compute PDE loss
+        pde_loss = PDE_loss(2)
+
+        # Model prediction for all time steps
+        y_pred = model(t)
+        y1_pred = y_pred[:, 0].view(-1, 1)
+        y2_pred = y_pred[:, 1].view(-1, 1)
+
+        # Compute derivatives
+        v1_pred = derivative(y1_pred, t)
+        v2_pred = derivative(y2_pred, t)
+
+        # Compute ground truth loss
+        ground_truth_loss1 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 0].view(-1, 1),
+                                      y1_ground_truth.to(DEVICE).view(-1, 1))
+        ground_truth_loss2 = MSE_LOSS(model(x_ground_truth.to(DEVICE).view(-1, 1))[:, 1].view(-1, 1),
+                                      y2_ground_truth.to(DEVICE).view(-1, 1))
+
+
+
+        # Initial conditions loss
+        initial_y_pred = model(initial_t.view(-1, 1))
+
+
+
+        # Ensure the initial_y_pred has the correct shape
+        if initial_y_pred.dim() == 1:
+            initial_y_pred = initial_y_pred.view(-1, 1)
+
+        initial_v1_pred = derivative(initial_y_pred[:, 0].view(-1, 1), initial_t)
+        initial_v2_pred = derivative(initial_y_pred[:, 1].view(-1, 1), initial_t)
+
+        initial_u1_pred = initial_y_pred[:, 0].view(-1, 1)
+        initial_u2_pred = initial_y_pred[:, 1].view(-1, 1)
+
+        initial_conditions_loss = MSE_LOSS(initial_v1_pred, initial_v1.view(-1, 1)) + MSE_LOSS(initial_v2_pred,
+                                                                                               initial_v2.view(-1, 1)) \
+                                  + MSE_LOSS(initial_u1_pred, initial_u1.view(-1, 1)) + MSE_LOSS(initial_u2_pred,
+                                                                                                 initial_u2.view(-1, 1))
+
+        # Total loss
+        loss = (Weight_MSE) * (ground_truth_loss1 + ground_truth_loss2) \
+               + (Weight_PDE) * pde_loss \
+               + (Weight_IC) * initial_conditions_loss  # Add initial conditions loss
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        # Log GPU utilization
+        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        gpu_utilizations.append(utilization)
+
+        # Enforce non-negativity of parameters
+        model.enforce_non_negative()
+
+        # Store the loss values
+        pde_loss_history.append(pde_loss.item())
+        ground_truth_loss1_history.append(ground_truth_loss1.item())
+        ground_truth_loss2_history.append(ground_truth_loss2.item())
+        #velocity_truth_loss_history.append(velocity_loss.item())
+        ic_loss_history.append(initial_conditions_loss.item())
+        overall_loss_history.append(loss.item())
+
+        # Print the loss values and learned parameters every 1000 epochs
+        if (epoch + 1) % 1000 == 0:
+            print(
+                f"Epoch: {epoch + 1}\tOverall Loss: {loss.item()}\tPDE Loss: {(1) * pde_loss.item()}\tGround Truth Loss1: {(1) * ground_truth_loss1.item()}"
+                f"\tGround Truth Loss2: {ground_truth_loss2.item()}\tInitial Conditions Loss: {initial_conditions_loss.item()}"
+                f"\tLearned d1: {model.mu1.item():.4f}\tLearned k1: {model.omega1.item():.4f}"
+                f"\tLearned d2: {model.mu2.item():.4f}\tLearned k2: {model.omega2.item():.4f}"
+                f"\tLearned d3: {model.mu3.item():.4f}\tLearned k3: {model.omega3.item():.4f}\tWeight MSE: {Weight_MSE:.4f}")
+            # Print the current learning rate every 1000 epochs
+            print("Current Learning Rate:", optimizer.param_groups[0]['lr'])
+
+
+
+end = time.time()
+training_time = end - start
+print(training_time)
+
+# Calculate average GPU utilization
+average_utilization = sum(gpu_utilizations) / len(gpu_utilizations)
+print(f'Average GPU Utilization during training: {average_utilization:.2f}%')
+
+# Shutdown NVML
+pynvml.nvmlShutdown()
 
 #model.eval()
 #torch.save(model, 'PINN_EDAG_DN_2.pkl')
@@ -341,9 +399,9 @@ t = np.linspace(0, 3, 300)
 u1_model, u2_model, v1_model, v2_model = solve_spring_mass_damper_eigenvalue(m1, m2, omega1, omega2, omega3, mu1, mu2, mu3, t)
 
 # Sampled ground truth data
-x_ground_truth = torch.tensor(t[0:300:2], dtype=torch.float32)
-y1_ground_truth = torch.tensor(u1_t[0:300:2], dtype=torch.float32)
-y2_ground_truth = torch.tensor(u2_t[0:300:2], dtype=torch.float32)
+x_ground_truth = torch.tensor(t[0:300:2], dtype=torch.float16)
+y1_ground_truth = torch.tensor(u1_t[0:300:2], dtype=torch.float16)
+y2_ground_truth = torch.tensor(u2_t[0:300:2], dtype=torch.float16)
 
 plt.plot(t, u1_t, color='tab:orange', linestyle='--', label='x1')
 plt.plot(t, u2_t, color='tab:blue', linestyle='--', label='x2')

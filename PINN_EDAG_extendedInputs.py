@@ -4,9 +4,18 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.linalg import expm
+import time
 
 def derivative(outputs, inputs):
-    return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
+    if not inputs.requires_grad:
+        inputs.requires_grad_(True)
+    grads = torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)
+    if len(grads) > 0:
+        return grads[0]
+    return None
+
+
+
 def solve_spring_mass_damper_eigenvalue(m1, m2, k1, k2, k3, d1, d2, d3, t):
     # Constructing the coefficient matrix
     A = np.array([
@@ -149,6 +158,7 @@ update_interval = 5000
 gamma = (target_lr / initial_lr) ** (1 / (20000 / update_interval))
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(DEVICE)
 
 model = PINN().to(DEVICE)
 optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
@@ -168,6 +178,7 @@ def PDE_loss(n):
     m = [1.0, 1.0]
 
     t = torch.linspace(0, 3, PDE_POINTS, requires_grad=True).view(-1, 1).to(DEVICE)
+
     k = torch.tensor([10.0, 50.0, 25.0], dtype=torch.float32).to(DEVICE).view(1, -1).repeat(PDE_POINTS, 1)
     d = torch.tensor([2.0, 1.0, 3.0], dtype=torch.float32).to(DEVICE).view(1, -1).repeat(PDE_POINTS, 1)
     x = model(t, k, d)
@@ -202,6 +213,9 @@ ground_truth_loss2_history = []
 velocity_truth_loss_history = []
 overall_loss_history = []
 
+# Record the start time
+start_time = time.time()
+
 model.train()
 
 for epoch in range(EPOCHS):
@@ -210,7 +224,8 @@ for epoch in range(EPOCHS):
     for data in train_tensors:
         t, k, d, y1_ground_truth, y2_ground_truth = [d.to(DEVICE) for d in data]
 
-        t = t.view(-1, 1)
+
+        t = torch.linspace(0, 3, 300, requires_grad=True).view(-1, 1).to(DEVICE)
         k = k.view(1, -1).repeat(t.shape[0], 1)
         d = d.view(1, -1).repeat(t.shape[0], 1)
 
@@ -222,10 +237,13 @@ for epoch in range(EPOCHS):
         v1_pred = derivative(y1_pred, t)
         v2_pred = derivative(y2_pred, t)
 
+
         ground_truth_loss1 = MSE_LOSS(y1_pred, y1_ground_truth.view(-1, 1))
         ground_truth_loss2 = MSE_LOSS(y2_pred, y2_ground_truth.view(-1, 1))
+
         velocity_loss = MSE_LOSS(v1_pred, derivative(y1_ground_truth.view(-1, 1), t)) + MSE_LOSS(v2_pred, derivative(
             y2_ground_truth.view(-1, 1), t))
+
 
         loss = (Weight_MSE) * (ground_truth_loss1 + ground_truth_loss2) \
                + (Weight_PDE) * pde_loss \
@@ -245,6 +263,13 @@ for epoch in range(EPOCHS):
 
     if epoch % 100 == 0:
         print(f'Epoch {epoch}/{EPOCHS} - Loss: {loss.item()}')
+
+
+# Record the end time
+end_time = time.time()
+# Calculate the elapsed time
+training_time = end_time - start_time
+print(f"Training time: {training_time:.2f} seconds")
 
 # Plotting the loss history
 plt.figure(figsize=(10, 8))
