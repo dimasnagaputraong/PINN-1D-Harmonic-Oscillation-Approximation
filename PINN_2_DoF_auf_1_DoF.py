@@ -26,67 +26,62 @@ def derivative(outputs, inputs):
     return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
 
 
-def solve_spring_mass_damper_eigenvalue_1(m, k, d, t):
-    # Constructing the coefficient matrix for the system
-    A = np.array([
-        [0, 1],
-        [-k/m, -d/m]
-    ])
+def harmonic_oscillator_solution(m, d, k, t):
+    # Calculate the discriminant
+    delta = d ** 2 - 4 * m * k
 
-    # Eigenvalue decomposition of A
-    eigenvalues, eigenvectors = np.linalg.eig(A)
+    if delta > 0:
+        # Overdamped case
+        r1 = (-d + np.sqrt(delta)) / (2 * m)
+        r2 = (-d - np.sqrt(delta)) / (2 * m)
+        # General solution: x(t) = C1 * exp(r1 * t) + C2 * exp(r2 * t)
+        # Assuming initial conditions x(0) = x0, x'(0) = v0
+        x0, v0 = 0.5, 0  # example initial conditions
+        A = np.array([[1, 1], [r1, r2]])
+        B = np.array([x0, v0])
+        C1, C2 = np.linalg.solve(A, B)
+        x_t = C1 * np.exp(r1 * t) + C2 * np.exp(r2 * t)
 
-    # Construct diagonal matrix of eigenvalues
-    Lambda = np.diag(eigenvalues)
+    elif delta == 0:
+        # Critically damped case
+        r = -d / (2 * m)
+        # General solution: x(t) = (C1 + C2 * t) * exp(r * t)
+        # Assuming initial conditions x(0) = x0, x'(0) = v0
+        x0, v0 = 0.5, 0  # example initial conditions
+        C1 = x0
+        C2 = v0 - r * x0
+        x_t = (C1 + C2 * t) * np.exp(r * t)
 
-    # Compute the matrix exponential of Lambda*t
-    exp_Lambda_t = np.array([expm(Lambda * ti) for ti in t])
+    else:
+        # Underdamped case
+        alpha = -d / (2 * m)
+        beta = np.sqrt(4 * m * k - d ** 2) / (2 * m)
+        # General solution: x(t) = exp(alpha * t) * (C1 * cos(beta * t) + C2 * sin(beta * t))
+        # Assuming initial conditions x(0) = x0, x'(0) = v0
+        x0, v0 = 0.5, 0  # example initial conditions
+        C1 = x0
+        C2 = (v0 - alpha * x0) / beta
+        x_t = np.exp(alpha * t) * (C1 * np.cos(beta * t) + C2 * np.sin(beta * t))
 
-    # Initial conditions: initial displacement (x0) and initial velocity (v0)
-    x0 = np.array([0.0, -10.0])  # Change these values as needed for different initial conditions
-
-    # Compute the solution using eigenvalue decomposition
-    V = eigenvectors
-    V_inv = np.linalg.inv(V)
-    x_t = np.array([np.dot(np.dot(V, exp_Lambda_t[i]), np.dot(V_inv, x0)) for i in range(len(t))])
-
-    # Extract displacement and velocity
-    displacement = x_t[:, 0]
-    velocity = x_t[:, 1]
-    acceleration = np.gradient(velocity, t)
-
-    # Plot displacement, velocity, and acceleration over time in subplots
-    fig, axs = plt.subplots(3, 1, figsize=(10, 18))
-
-    axs[0].plot(t, displacement, label='Displacement (x(t))')
-    axs[0].set_xlabel('Time (s)')
-    axs[0].set_ylabel('Displacement (m)')
-    axs[0].set_title('Displacement over Time')
-    axs[0].legend()
-    axs[0].grid(True)
-
-    axs[1].plot(t, velocity, label='Velocity (v(t))')
-    axs[1].set_xlabel('Time (s)')
-    axs[1].set_ylabel('Velocity (m/s)')
-    axs[1].set_title('Velocity over Time')
-    axs[1].legend()
-    axs[1].grid(True)
-
-    axs[2].plot(t, acceleration, label='Acceleration (a(t))')
-    axs[2].set_xlabel('Time (s)')
-    axs[2].set_ylabel('Acceleration (m/s^2)')
-    axs[2].set_title('Acceleration over Time')
-    axs[2].legend()
-    axs[2].grid(True)
-
-    plt.tight_layout()
+    plt.plot(t, x_t)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Displacement (x)')
+    plt.title('Harmonic Oscillator Mass-Spring-Damper System')
+    plt.grid(True)
     plt.show()
 
-    return displacement, velocity
+    return x_t
 
-m1= 1.0
+
+# Example usage:
+m = 1.0  # mass
+d = 0.6  # damping coefficient
+k = 8.0  # spring constant
 t = np.linspace(0, 3, 300)
-u2_model, v2_model = solve_spring_mass_damper_eigenvalue_1(m1, omega1, mu1, t)
+
+x_t = harmonic_oscillator_solution(m, d, k, t)
+
+
 
 def solve_spring_mass_damper_eigenvalue(m1, m2, k1, k2, k3, d1, d2, d3, t):
     # Constructing the coefficient matrix
@@ -109,7 +104,7 @@ def solve_spring_mass_damper_eigenvalue(m1, m2, k1, k2, k3, d1, d2, d3, t):
     # Compute the solution using eigenvalue decomposition
     V = eigenvectors
     V_inv = np.linalg.inv(V)
-    x0 = np.array([0, 10, 0, -10])  # initial_u1, initial_v1, initial_u2, initial_v2
+    x0 = np.array([0.5, 0, 0.5, 0])  # initial_u1, initial_v1, initial_u2, initial_v2
     x_t = np.array([np.dot(np.dot(V, exp_Lambda_t[i]), np.dot(V_inv, x0)) for i in range(len(t))])
 
     # Extract displacement, velocity, and acceleration for u1 and u2
@@ -233,10 +228,10 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=update_interval
 MSE_LOSS = nn.MSELoss().to(DEVICE)
 
 #Assign different weight for loss function
-Weight_PDE = 1e-3
+Weight_PDE = 1e-4
 Weight_MSE = 1
-Weight_Velocity = 1e-3
-Weight_IC = 1e-3
+Weight_Velocity = 1
+Weight_IC = 1
 
 PDE_POINTS = 300
 
@@ -283,7 +278,6 @@ def PDE_loss_1():
 
     t = torch.linspace(0, 3, PDE_POINTS, requires_grad=True, device=torch.device("cuda")).view(-1, 1)
     x = model(t)
-    x = x[:, 0].view(-1, 1)
 
     # Calculate the derivatives
     x_t = derivative(x, t)
@@ -324,7 +318,7 @@ for epoch in range(EPOCHS):
 
         # Define the initial conditions
         initial_t = torch.tensor([0.0], requires_grad=True).to(DEVICE)
-        initial_v2 = torch.tensor([-10.0], requires_grad=True).to(DEVICE)
+        initial_v2 = torch.tensor([0.0], requires_grad=True).to(DEVICE)
         initial_u2 = torch.tensor([0.0], requires_grad=True).to(DEVICE)
 
         # Compute PDE loss
@@ -358,8 +352,8 @@ for epoch in range(EPOCHS):
         # Total loss
         loss = (Weight_MSE) * ground_truth_loss2 \
                + (Weight_PDE) * pde_loss \
-               + (Weight_IC) * initial_condition_loss\
-               + (Weight_Velocity) * velocity_loss
+               #+ (Weight_Velocity) * velocity_loss
+            # + (Weight_IC) * initial_condition_loss\
 
         # Backward pass
         optimizer.zero_grad()
@@ -453,7 +447,7 @@ print(trained_parameters)
 
 m1= 1.0
 t = np.linspace(0, 3, 300)
-u2_model, v2_model = solve_spring_mass_damper_eigenvalue_1(m1, omega1, mu1, t)
+u2_model= harmonic_oscillator_solution(m1, mu1, omega1, t)
 
 # Sampled ground truth data
 x_ground_truth = torch.tensor(t[0:300:2], dtype=torch.float16)
@@ -466,9 +460,3 @@ plt.title(f'Final Prediction -- Learned d1: {model.mu1.item():.4f} -- Learned k1
 plt.legend(['Ground Truth x2', 'x2 from model predicted parameter'])
 plt.show()
 
-
-plt.plot(t, v2_t, color='tab:blue', linestyle='--', label='v2')
-plt.plot(t, v2_model, color='tab:blue', label='v2 from model predicted parameter')
-plt.title(f'Final Prediction -- Learned d1: {model.mu1.item():.4f} -- Learned k1: {model.omega1.item():.4f}')
-plt.legend(['Ground Truth x2', 'x2 from model predicted parameter'])
-plt.show()
