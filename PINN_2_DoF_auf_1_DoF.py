@@ -7,6 +7,7 @@ from matplotlib import pyplot as plt
 from scipy.linalg import expm
 from torch.utils.data import DataLoader, TensorDataset
 import pynvml
+import matplotlib.animation as animation
 
 # Initialize NVML
 pynvml.nvmlInit()
@@ -14,6 +15,8 @@ device_index = 0  # Change this if you have multiple GPUs
 handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
 
 #plt.style.use('dark_background')
+
+
 
 
 # Function to safely convert a tensor to numpy array
@@ -77,7 +80,7 @@ def harmonic_oscillator_solution(m, d, k, t):
 m = 1.0  # mass
 d = 0.6  # damping coefficient
 k = 8.0  # spring constant
-t = np.linspace(0, 3, 300)
+t = np.linspace(0, 6, 600)
 
 x_t = harmonic_oscillator_solution(m, d, k, t)
 
@@ -151,21 +154,20 @@ def solve_spring_mass_damper_eigenvalue(m1, m2, k1, k2, k3, d1, d2, d3, t):
 m1, m2 = 1.0, 1.0
 k1, k2, k3 = 10.0, 50.0, 25.0
 d1, d2, d3 = 2.0, 1.0, 3.0
-t = np.linspace(0, 3, 300)
+t = np.linspace(0, 6, 600)
 
 u1_t, u2_t, v1_t, v2_t = solve_spring_mass_damper_eigenvalue(m1, m2, k1, k2, k3, d1, d2, d3, t)
 
 # Sampled ground truth data
-x_ground_truth = torch.tensor(t[0:300:1], dtype=torch.float32, device=torch.device("cpu"))
-y1_ground_truth = torch.tensor(u1_t[0:300:1], dtype=torch.float32, device=torch.device("cpu"))
-y2_ground_truth = torch.tensor(u2_t[0:300:1], dtype=torch.float32, device=torch.device("cpu"))
-v1_ground_truth = torch.tensor(v1_t[0:300:1], dtype=torch.float32, device=torch.device("cpu"))
-v2_ground_truth = torch.tensor(v2_t[0:300:1], dtype=torch.float32, device=torch.device("cpu"))
+x_ground_truth = torch.tensor(t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
+y1_ground_truth = torch.tensor(u1_t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
+y2_ground_truth = torch.tensor(u2_t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
+v1_ground_truth = torch.tensor(v1_t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
+v2_ground_truth = torch.tensor(v2_t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
 
 # create DataLoader, then take one batch
 loader = DataLoader(list(zip(x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth)),
                     shuffle=True, batch_size=5000, pin_memory=False)
-
 
 
 plt.plot(t, u1_t, label='u1(t)')
@@ -176,40 +178,108 @@ plt.legend(['Ground Truth u1', 'Ground Truth u2', 'Sampled Data u1', 'Sampled Da
 plt.show()
 
 
-
+# Define the neural network architecture
 class PINN(nn.Module):
     def __init__(self):
-        super().__init__()
-        self.mu1 = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
-        self.omega1 = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
-        self.model = nn.Sequential(
-            nn.Linear(1, 128),
+        super(PINN, self).__init__()
+        self.hidden = nn.Sequential(
+            nn.Linear(1, 100),
             nn.Sigmoid(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Sigmoid(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Sigmoid(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Sigmoid(),
-            #nn.Linear(128, 128),
-            #nn.Sigmoid(),
-            nn.Linear(128, 1),
+            nn.Linear(100, 100),
+            nn.Sigmoid(),
+            nn.Linear(100, 1)
         )
+        # Initialize parameters k and d as trainable parameters with constraints
+        self.k = nn.Parameter(torch.tensor(8.0, dtype=torch.float32))
+        self.d = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, t):
+        return self.hidden(t)
 
-    def enforce_non_negative(self):
-        # Clamping parameters to ensure non-negativity
-        self.mu1.data.clamp_(min=0)
-        self.omega1.data.clamp_(min=0)
+    def get_params(self):
+        # Ensure k and d remain positive and d is not larger than k
+        k = torch.abs(self.k)
+        d = torch.abs(self.d)
+        return k, d
+
+def loss_function(model, t, x2, v2, x0, m=1.0):
+    """
+    Computes the loss function for a physics-informed neural network.
+
+    Parameters:
+    - model: The neural network model.
+    - t: Tensor of time values.
+    - x2: Tensor of true displacement values.
+    - v2: Tensor of true velocity values.
+    - x0: Initial displacement.
+    - v0: Initial velocity.
+    - m: Mass parameter, default is 1.0.
+    - weight_physics: Weight for the physics loss term.
+    - weight_data: Weight for the data loss term.
+    - weight_velocity: Weight for the velocity loss term.
+    - weight_initial: Weight for the initial condition loss term.
+    - weight_regularization: Weight for the regularization loss term.
+
+    Returns:
+    - Tuple containing total loss and individual loss components.
+    """
+
+    weight_physics = 1.0
+    weight_data = 1.0
+    weight_velocity = 1.0
+    weight_initial = 0.0
+    weight_regularization = 1e-6
+
+    # Predicted displacement
+    x2_pred = model(t)
+
+    # Compute the first derivative of predicted displacement w.r.t. time
+    x2_t = torch.autograd.grad(x2_pred, t, torch.ones_like(x2_pred), create_graph=True)[0]
+
+    # Compute the second derivative of predicted displacement w.r.t. time
+    x2_tt = torch.autograd.grad(x2_t, t, torch.ones_like(x2_t), create_graph=True)[0]
+
+    # Get parameters from the model
+    k, d = model.get_params()
+
+    # Simplified system equation: m * x2_tt + d * x2_t + k * x2_pred = 0
+    physics_loss = torch.mean((m * x2_tt + d * x2_t + k * x2_pred) ** 2)
+
+    # Data loss: mean squared error between predicted and true displacements
+    data_loss = torch.mean((x2_pred - x2) ** 2)
+
+    # Velocity loss: mean squared error between predicted and true velocities
+    velocity_loss = torch.mean((x2_t - v2) ** 2)
+
+    # Initial condition loss: ensuring the model respects the initial conditions
+    initial_condition_loss = torch.mean((x2_pred[0] - x0) ** 2)
+
+    # Regularization to enforce physical constraints
+    regularization_loss = (k - 10.0) ** 2 + (d - 0.1) ** 2
+
+    # Total loss is a combination of weighted physics, data, velocity, initial condition, and regularization losses
+    total_loss = (weight_physics * physics_loss +
+                  weight_data * data_loss +
+                  weight_velocity * velocity_loss +
+                  weight_initial * initial_condition_loss +
+                  weight_regularization * regularization_loss)
+
+    return total_loss, physics_loss, data_loss, velocity_loss, initial_condition_loss, regularization_loss
+
+
 
 EPOCHS = 15000
 gpu_utilizations = []
 
 # Define the initial and target learning rates
-initial_lr = 1e-2
-target_lr = 1e-3
+initial_lr = 1e-3
+target_lr = 1e-4
 
 # Define the number of epochs between each learning rate update
 update_interval = 5000
@@ -221,78 +291,20 @@ gamma = (target_lr / initial_lr) ** (1 / (20000 / update_interval))
 DEVICE = torch.device("cuda")
 print(DEVICE)
 
-#model = torch.load('PINN_EDAG_DN.pkl')
+#model = torch.load('PINN_EDAG_2DoF_auf_1_DoF.pkl')
+#model = model.to(DEVICE)
 model = PINN().to(DEVICE)
 optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=update_interval, gamma=gamma)
 MSE_LOSS = nn.MSELoss().to(DEVICE)
 
-#Assign different weight for loss function
-Weight_PDE = 1e-4
-Weight_MSE = 1
-Weight_Velocity = 1
-Weight_IC = 1
 
-PDE_POINTS = 300
-
-def PDE_loss(n):
-
-    mu = [getattr(model, f'mu{i}') for i in range(1, n + 2)]
-    omega = [getattr(model, f'omega{i}') for i in range(1, n + 2)]
-    m = [1.0, 1.0]
-
-    t = torch.linspace(0, 3, PDE_POINTS, requires_grad=True, device=torch.device("cuda")).view(-1, 1)
-    x = model(t)
-    x = [x[:, i].view(-1, 1) for i in range(n)]
-
-    # Calculate the derivatives
-    x_t = [derivative(x_i, t) for x_i in x]
-    x_tt = [derivative(x_i_t, t) for x_i_t in x_t]
-
-
-    ODE_output = []
-
-    for i in range(n):
-        if i == 0:
-            ODE_i = m[i] * x_tt[i] + (mu[i] + mu[i + 1]) * x_t[i] + (omega[i] + omega[i + 1]) * x[i] - omega[i + 1] * x[
-                i + 1] - mu[i + 1] * x_t[i + 1]
-        elif i == n - 1:
-            ODE_i = m[i] * x_tt[i] + (mu[i] + mu[i + 1]) * x_t[i] + (omega[i] + omega[i + 1]) * x[i] - omega[i] * x[
-                i - 1] - mu[i] * x_t[i - 1]
-        else:
-            ODE_i = m[i] * x_tt[i] + (mu[i] + mu[i + 1]) * x_t[i] + (omega[i] + omega[i + 1]) * x[i] - omega[i + 1] * x[
-                i + 1] - mu[i + 1] * x_t[i + 1] - omega[i] * x[i - 1] - mu[i] * x_t[i - 1]
-
-        ODE_output.append(ODE_i)
-
-
-    loss = sum(torch.mean(torch.square(ODE_i)) for ODE_i in ODE_output)
-
-    return loss
-
-def PDE_loss_1():
-
-    mu = getattr(model, f'mu{1}')
-    omega = getattr(model, f'omega{1}')
-    m = 1.0
-
-    t = torch.linspace(0, 3, PDE_POINTS, requires_grad=True, device=torch.device("cuda")).view(-1, 1)
-    x = model(t)
-
-    # Calculate the derivatives
-    x_t = derivative(x, t)
-    x_tt = derivative(x_t, t)
-
-    ODE = (m * x_tt) + (mu * x_t) + (omega * x)
-
-    loss = torch.mean(torch.square(ODE))
-
-    return loss
+PDE_POINTS = 600
 
 
 # Lists to store loss history
 pde_loss_history = []
-ground_truth_loss1_history = []
+regularization_loss_history = []
 ground_truth_loss2_history = []
 velocity_truth_loss_history = []
 ic_loss_history = []
@@ -302,62 +314,28 @@ start = time.time()
 
 model.train()
 
+# Example initial conditions
+x0 = 0.5  # initial displacement
 
 
 for epoch in range(EPOCHS):
     for batch_idx, (x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth) in enumerate(loader):
 
-        model.enforce_non_negative()
+        #model.enforce_non_negative()
 
         x_ground_truth = x_ground_truth.view(-1, 1).to(DEVICE)
         y2_ground_truth = y2_ground_truth.view(-1, 1).to(DEVICE)
         v2_ground_truth = v2_ground_truth.view(-1, 1).to(DEVICE)
 
         # Time tensor for the training step
-        t = torch.linspace(0, 3, 300, requires_grad=True).view(-1, 1).to(DEVICE)
+        t = torch.linspace(0, 6, 600, requires_grad=True).view(-1, 1).to(DEVICE)
 
-        # Define the initial conditions
-        initial_t = torch.tensor([0.0], requires_grad=True).to(DEVICE)
-        initial_v2 = torch.tensor([0.0], requires_grad=True).to(DEVICE)
-        initial_u2 = torch.tensor([0.0], requires_grad=True).to(DEVICE)
-
-        # Compute PDE loss
-        pde_loss = PDE_loss_1()
-
-
-        # Model prediction for all time steps
-        y_pred = model(t)
-
-        # Compute derivatives
-        v_pred = derivative(y_pred, t)
-
-        velocity_loss = MSE_LOSS(v_pred, v2_ground_truth.to(DEVICE).view(-1, 1))
-
-        # Compute ground truth loss
-        ground_truth_loss2 = MSE_LOSS(model(t),y2_ground_truth)
-
-        # Initial conditions loss
-        initial_y_pred = model(initial_t)
-
-        # Ensure the initial_y_pred has the correct shape
-        #if initial_y_pred.dim() == 1:
-        #    initial_y_pred = initial_y_pred.view(-1, 1)
-
-        initial_v2_pred = derivative(initial_y_pred, initial_t)
-
-        initial_u2_pred = initial_y_pred
-
-        initial_condition_loss = MSE_LOSS(initial_v2_pred, initial_v2.view(-1, 1)) + MSE_LOSS(initial_u2_pred, initial_u2.view(-1, 1))
-
-        # Total loss
-        loss = (Weight_MSE) * ground_truth_loss2 \
-               + (Weight_PDE) * pde_loss \
-               #+ (Weight_Velocity) * velocity_loss
-            # + (Weight_IC) * initial_condition_loss\
+        total_loss, physics_loss, data_loss, velocity_loss, initial_condition_loss, regularization_loss = loss_function(
+            model, t, y2_ground_truth, v2_ground_truth, x0)
 
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
         scheduler.step()
 
@@ -365,26 +343,25 @@ for epoch in range(EPOCHS):
         utilization = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
         gpu_utilizations.append(utilization)
 
-
-        # Enforce non-negativity of parameters
-        model.enforce_non_negative()
-
-        # Store the loss values
-        pde_loss_history.append(pde_loss.item())
-        #ground_truth_loss1_history.append(ground_truth_loss1.item())
-        ground_truth_loss2_history.append(ground_truth_loss2.item())
+        overall_loss_history.append(total_loss.item())
+        pde_loss_history.append(physics_loss.item())
+        ground_truth_loss2_history.append(data_loss.item())
         velocity_truth_loss_history.append(velocity_loss.item())
         ic_loss_history.append(initial_condition_loss.item())
-        overall_loss_history.append(loss.item())
+        regularization_loss_history.append(regularization_loss.item())
 
-        # Print the loss values and learned parameters every 1000 epochs
+        # Print the loss values and learned parameters every 100 epochs
         if (epoch + 1) % 100 == 0:
             print(
-                f"Epoch: {epoch + 1}\tOverall Loss: {loss.item()}\tPDE Loss: {(1) * pde_loss.item()}\tIC Loss: {(1) * initial_condition_loss.item()}"
-                f"\tGround Truth Loss2: {ground_truth_loss2.item()}\tVelocity Loss: {velocity_loss.item()}"
-                f"\tLearned d1: {model.mu1.item():.4f}\tLearned k1: {model.omega1.item():.4f}")
-            # Print the current learning rate every 1000 epochs
+                f"Epoch: {epoch + 1}\tTotal Loss: {total_loss.item()}\tPhysics Loss: {physics_loss.item()}\t"
+                f"Data Loss: {data_loss.item()}\tVelocity Loss: {velocity_loss.item()}\t"
+                f"Initial Condition Loss: {initial_condition_loss.item()}\tRegularization Loss: {regularization_loss.item()}"
+            )
+            # Print the current learning rate every 100 epochs
             print("Current Learning Rate:", optimizer.param_groups[0]['lr'])
+            k, d = model.get_params()
+            print(f'Epoch {epoch}, Total Loss: {total_loss.item()}, k: {k.item()}, d: {d.item()}')
+
 
 
 
@@ -392,9 +369,10 @@ end = time.time()
 training_time = end - start
 print(training_time)
 
+
 #model.eval()
-#torch.save(model, 'PINN_EDAG_DN_2.pkl')
-#model = torch.load('PINN_EDAG_DN.pkl')
+torch.save(model, 'PINN_EDAG_2DoF_auf_1_DoF.pkl')
+#model = torch.load('PINN_EDAG_2DoF_auf_1_DoF.pkl')
 
 # Plot GPU utilization
 plt.plot(gpu_utilizations)
@@ -410,7 +388,7 @@ plt.figure(figsize=(10, 6))
 plt.plot(pde_loss_history, label='PDE Loss')
 plt.plot(velocity_truth_loss_history, label='Velocity Loss')
 plt.plot(ic_loss_history, label='IC Loss')
-#plt.plot(ground_truth_loss1_history, label='Ground Truth Loss 1')
+plt.plot(regularization_loss_history, label='Regularization Loss')
 plt.plot(ground_truth_loss2_history, label='Ground Truth Loss 2')
 plt.plot(overall_loss_history, label='Overall Loss', linestyle='--')
 plt.xlabel('Epoch')
@@ -430,33 +408,33 @@ plt.show()
 #plt.legend(["Expected u1", "Predicted u1", "Expected u2", "Predicted u2"])
 #plt.show()
 
+# Retrieve the learned parameters and move them to CPU
+omega1, mu1 = model.get_params()
+omega1 = omega1.cpu().detach().numpy()
+mu1 = mu1.cpu().detach().numpy()
 
-#ODE Test from Model parameter
-mu1 = model.mu1.item()
-omega1 = model.omega1.item()
-
-
-# Store them as a dictionary for easy access
+# Print or use the trained parameters as needed
 trained_parameters = {
     'mu1': mu1,
     'omega1': omega1
 }
 
-# Print or use the trained parameters as needed
 print(trained_parameters)
 
-m1= 1.0
-t = np.linspace(0, 3, 300)
-u2_model= harmonic_oscillator_solution(m1, mu1, omega1, t)
+m1 = 1.0
+t = np.linspace(0, 6, 600)
+u2_model = harmonic_oscillator_solution(m1, mu1, omega1, t)
 
 # Sampled ground truth data
-x_ground_truth = torch.tensor(t[0:300:2], dtype=torch.float16)
-y1_ground_truth = torch.tensor(u1_t[0:300:2], dtype=torch.float16)
-y2_ground_truth = torch.tensor(u2_t[0:300:2], dtype=torch.float16)
+x_ground_truth = torch.tensor(t[0:600:1], dtype=torch.float16)
+y1_ground_truth = torch.tensor(u1_t[0:600:1], dtype=torch.float16)
+y2_ground_truth = torch.tensor(u2_t[0:600:1], dtype=torch.float16)
 
 plt.plot(t, u2_t, color='tab:blue', linestyle='--', label='x2')
 plt.plot(t, u2_model, color='tab:blue', label='x2 from model predicted parameter')
-plt.title(f'Final Prediction -- Learned d1: {model.mu1.item():.4f} -- Learned k1: {model.omega1.item():.4f}')
+plt.title(f'Final Prediction -- Learned d1: {mu1:.4f} -- Learned k1: {omega1:.4f}')
 plt.legend(['Ground Truth x2', 'x2 from model predicted parameter'])
 plt.show()
+
+
 
