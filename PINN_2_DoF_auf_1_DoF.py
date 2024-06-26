@@ -83,6 +83,7 @@ k = 8.0  # spring constant
 t = np.linspace(0, 6, 600)
 
 x_t = harmonic_oscillator_solution(m, d, k, t)
+x_t = torch.tensor(x_t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
 
 
 
@@ -166,7 +167,7 @@ v1_ground_truth = torch.tensor(v1_t[0:600:1], dtype=torch.float32, device=torch.
 v2_ground_truth = torch.tensor(v2_t[0:600:1], dtype=torch.float32, device=torch.device("cpu"))
 
 # create DataLoader, then take one batch
-loader = DataLoader(list(zip(x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth)),
+loader = DataLoader(list(zip(x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth, x_t)),
                     shuffle=True, batch_size=5000, pin_memory=False)
 
 
@@ -319,13 +320,14 @@ x0 = 0.5  # initial displacement
 
 
 for epoch in range(EPOCHS):
-    for batch_idx, (x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth) in enumerate(loader):
+    for batch_idx, (x_ground_truth, y1_ground_truth, y2_ground_truth, v1_ground_truth, v2_ground_truth, x_t) in enumerate(loader):
 
         #model.enforce_non_negative()
 
         x_ground_truth = x_ground_truth.view(-1, 1).to(DEVICE)
         y2_ground_truth = y2_ground_truth.view(-1, 1).to(DEVICE)
         v2_ground_truth = v2_ground_truth.view(-1, 1).to(DEVICE)
+        x_t = x_t.view(-1, 1).to(DEVICE)
 
         # Time tensor for the training step
         t = torch.linspace(0, 6, 600, requires_grad=True).view(-1, 1).to(DEVICE)
