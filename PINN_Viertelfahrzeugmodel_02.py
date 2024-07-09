@@ -4,15 +4,30 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from scipy.integrate import odeint
 import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
 from scipy.integrate import solve_ivp
-
 import pynvml
 
 # Initialize NVML
 pynvml.nvmlInit()
 device_index = 0  # Change this if you have multiple GPUs
 handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+
+def mass_spring_damper(state, t, m, d, k):
+
+    x, v = state  # unpack the state vector
+    dxdt = v  # derivative of x is velocity
+    dvdt = (-d * v - k * x) / m  # derivative of v is acceleration
+    return [dxdt, dvdt]
+
+def solve_harmonic_oscillator(m, d, k, x0, v0, t):
+
+    initial_state = [x0, v0]
+    states = odeint(mass_spring_damper, initial_state, t, args=(m, d, k))
+    return states[:, 0], states[:, 1]
 
 
 def save_gif_PIL(outfile, files, fps=5, loop=0):
@@ -34,28 +49,33 @@ def plot_result(x, y, x_data, y_data, yh, xp=None):
     l = plt.legend(loc=(1.01, 0.34), frameon=False, fontsize="large")
     plt.setp(l.get_texts(), color="k")
     plt.xlim(-0.05, 6.05)
-    plt.ylim(-0.5, 0.5)
+    plt.ylim(-0.2, 0.2)
     plt.text(1.065, 0.7, "Training step: %i" % (i + 1), fontsize="xx-large", color="k")
     plt.axis("off")
+
 
 def estimate_k_d(t, y, m):
     # Ensure y is a numpy array for easier manipulation
     y = y.cpu().numpy().flatten()
 
-    # Estimate the period (T)
-    peaks_indices = (np.diff(np.sign(np.diff(y))) < 0).nonzero()[0] + 1  # indices of peaks
-    if len(peaks_indices) < 2:
-        raise ValueError("Not enough peaks found in the dataset to estimate the period.")
+    def damped_oscillator(t, A, B, omega_n, zeta):
+        if zeta < 1:
+            omega_d = omega_n * np.sqrt(1 - zeta ** 2)
+            return np.exp(-zeta * omega_n * t) * (A * np.cos(omega_d * t) + B * np.sin(omega_d * t))
+        elif zeta == 1:
+            return (A + B * t) * np.exp(-omega_n * t)
+        else:
+            term1 = np.exp(-zeta * omega_n * t)
+            term2 = np.exp(omega_n * np.sqrt(zeta ** 2 - 1) * t)
+            term3 = np.exp(-omega_n * np.sqrt(zeta ** 2 - 1) * t)
+            return term1 * (A * term2 + B * term3)
 
-    T = np.mean(np.diff(t[peaks_indices]))  # Average time between peaks
+    # Initial guesses for A, B, omega_n, and zeta
+    initial_guess = [y[0], 0, 1.0, 0.5]
 
-    # Estimate the natural frequency (omega_n)
-    omega_n = 2 * np.pi / T
-
-    # Estimate the damping ratio (zeta) using logarithmic decrement
-    peak_amplitudes = y[peaks_indices]
-    delta = np.mean(np.log(peak_amplitudes[:-1] / peak_amplitudes[1:]))
-    zeta = delta / np.sqrt(4 * np.pi ** 2 + delta ** 2)
+    # Fit the damped oscillator model to the data
+    params, _ = curve_fit(damped_oscillator, t, y, p0=initial_guess)
+    A, B, omega_n, zeta = params
 
     # Calculate initial estimates for k and d
     k = m * omega_n ** 2
@@ -63,19 +83,29 @@ def estimate_k_d(t, y, m):
 
     return k, d
 
-def oscillator(m, k, d, x):
-    """Defines the analytical solution to the 1D underdamped harmonic oscillator problem with zero initial displacement."""
+def oscillator(m, k, d, t):
+    """Defines the analytical solution to the 1D harmonic oscillator problem with zero initial displacement."""
     w0 = np.sqrt(k / m)
-    assert d < 2 * np.sqrt(k * m)  # Ensure it's underdamped
-    w = np.sqrt(w0 ** 2 - (d / (2 * m)) ** 2)
-    phi = np.arctan(-d / (2 * m * w))
+    zeta = d / (2 * np.sqrt(k * m))  # Damping ratio
 
-    # Adjust amplitude A to ensure initial displacement y(0) = 0
-    A = 1 / (2 * np.cos(phi))
+    if zeta < 1:  # Underdamped
+        w_d = w0 * np.sqrt(1 - zeta**2)
+        A = 1  # Initial amplitude
+        phi = 0  # Phase
+        y = A * torch.exp(-zeta * w0 * t) * torch.cos(w_d * t + phi)
 
-    cos = torch.cos(w * x)
-    exp = torch.exp(-d / (2 * m) * x)
-    y = exp * 2 * A * cos - 2 * A
+    elif zeta == 1:  # Critically damped
+        A = 1  # Initial amplitude
+        B = 0  # Assume no initial velocity for simplicity
+        y = (A + B * t) * torch.exp(-w0 * t)
+
+    else:  # Overdamped
+        r1 = -w0 * (zeta + np.sqrt(zeta**2 - 1))
+        r2 = -w0 * (zeta - np.sqrt(zeta**2 - 1))
+        A = 0.5  # Initial amplitude
+        B = 0.5  # Assume no initial velocity for simplicity
+        y = A * torch.exp(r1 * t) + B * torch.exp(r2 * t)
+
     return y
 
 # Define the road input (hole of -0.1 meter)
@@ -129,8 +159,8 @@ print(f"Using device: {device}")
 # Parameters
 m_F = 537  # kg, mass of the body
 m_R = 68    # kg, mass of the tire
-c_F = 41332  # N/m, stiffness of the suspension
-d_F = 1224   # Ns/m, damping of the suspension
+c_F = 41332  # N/m, stiffness of the chasis
+d_F = 5200   # Ns/m, damping of the chasis
 c_R = 365834  # N/m, stiffness of the tire
 d_R = 80    # Ns/m, damping of the tire
 
@@ -195,6 +225,8 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
+
+
 t = np.linspace(0, 6, 600)
 x = torch.tensor(t[0:600:1], dtype=torch.float32).view(-1,1).to(device)
 y = torch.tensor(z_F[0:600:1], dtype=torch.float32).view(-1,1).to(device)
@@ -208,10 +240,6 @@ init_k, init_d = estimate_k_d(t, y, m)
 print(f"Estimated k: {init_k}")
 print(f"Estimated d: {init_d}")
 
-# Get the analytical solution over the full domain
-#x = torch.linspace(0, 1, 500).view(-1, 1).to(device)
-#y = oscillator(m, 20, 0.1, x).view(-1, 1).to(device)  # Use the initial k and d for the exact solution
-print(x.shape, y.shape)
 
 # Sample the whole curve
 x_data = x[0:600:10]
@@ -348,15 +376,46 @@ with torch.no_grad():
     learned_d = model.d.item()
     y_learned = oscillator(m, learned_k, learned_d, x).view(-1, 1)
 
-plt.figure(figsize=(8, 4))
+
+# Initial conditions
+x0 = 0.1  # initial displacement in meters
+v0 = 0.0  # initial velocity in m/s
+
+# Time array
+t = np.linspace(0, 6, 600)  # 10 seconds, 250 points
+
+# Solve
+x_t, v_t = solve_harmonic_oscillator(m, learned_d, learned_k, x0, v0, t)
+
+# Plotting
+plt.figure(figsize=(12, 6))
+plt.subplot(211)
 plt.plot(x.cpu(), y.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
-plt.plot(x.cpu(), y_learned.cpu(), color="tab:red", linewidth=2, alpha=0.8, label="Learned solution")
-plt.scatter(x_data.cpu(), y_data.cpu(), s=60, color="tab:orange", alpha=0.4, label='Training data')
-plt.xlabel('Time (s)')
+plt.plot(t, x_t, 'b', label='Displacement (x)')
+plt.title('Displacement and Velocity Over Time')
 plt.ylabel('Displacement (m)')
-plt.title('Comparison of Exact and Learned Solutions')
-plt.legend()
-plt.grid(True)
+plt.legend(loc='best')
+
+plt.subplot(212)
+plt.plot(x.cpu(), v.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
+plt.plot(t, v_t, 'r', label='Velocity (v)')
+plt.xlabel('Time (s)')
+plt.ylabel('Velocity (m/s)')
+plt.legend(loc='best')
 file = "plots_pinn1d_Viertelfahrzeugmodel/pinn_parameter_result.png"
 plt.savefig(file)
+plt.tight_layout()
 plt.show()
+
+#plt.figure(figsize=(8, 4))
+#plt.plot(x.cpu(), y.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
+#plt.plot(x.cpu(), y_learned.cpu(), color="tab:red", linewidth=2, alpha=0.8, label="Learned solution")
+#plt.scatter(x_data.cpu(), y_data.cpu(), s=60, color="tab:orange", alpha=0.4, label='Training data')
+#plt.xlabel('Time (s)')
+#plt.ylabel('Displacement (m)')
+#plt.title('Comparison of Exact and Learned Solutions')
+#plt.legend()
+#plt.grid(True)
+#file = "plots_pinn1d_Viertelfahrzeugmodel/pinn_parameter_result.png"
+#plt.savefig(file)
+#plt.show()
