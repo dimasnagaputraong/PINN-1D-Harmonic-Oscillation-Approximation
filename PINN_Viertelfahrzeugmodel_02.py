@@ -8,13 +8,16 @@ from scipy.integrate import odeint
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.integrate import solve_ivp
+from scipy.linalg import eig
 import pynvml
+import csv
 
 # Initialize NVML
 pynvml.nvmlInit()
 device_index = 0  # Change this if you have multiple GPUs
 handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
 
+csv_file_path = 'Dataset_BMW_KPI.csv'
 
 def mass_spring_damper(state, t, m, d, k):
 
@@ -49,10 +52,15 @@ def plot_result(x, y, x_data, y_data, yh, xp=None):
     l = plt.legend(loc=(1.01, 0.34), frameon=False, fontsize="large")
     plt.setp(l.get_texts(), color="k")
     plt.xlim(-0.05, 6.05)
-    plt.ylim(-0.2, 0.2)
+    plt.ylim(-0.5, 0.5)
     plt.text(1.065, 0.7, "Training step: %i" % (i + 1), fontsize="xx-large", color="k")
     plt.axis("off")
 
+# Save results to CSV
+def save_results_to_csv(file_path, results):
+    with open(file_path, 'a', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(results)
 
 def estimate_k_d(t, y, m):
     # Ensure y is a numpy array for easier manipulation
@@ -108,6 +116,12 @@ def oscillator(m, k, d, t):
 
     return y
 
+def calculate_damping_quality_kpi(k, d, m):
+    eigenfrequency = np.sqrt(k / m) / (2 * np.pi) #Eigenfrequenz
+    damping_ratio = d / (2 * np.sqrt(k * m)) #Dämpfungsgrad
+    quality_factor = 1 / (2 * damping_ratio) #Gütefaktor
+    return eigenfrequency, damping_ratio, quality_factor
+
 # Define the road input (hole of -0.1 meter)
 def z_S(t):
     return 0
@@ -123,6 +137,15 @@ def quarter_car_model(t, y):
     dz_R_dt = v_R
     dv_F_dt = (-c_F * (z_F - z_R) - d_F * (v_F - v_R)) / m_F
     dv_R_dt = (c_F * (z_F - z_R) + d_F * (v_F - v_R) - c_R * (z_R - z_S(t)) - d_R * (v_R - z_S_dot(t))) / m_R
+    return [dz_F_dt, dv_F_dt, dz_R_dt, dv_R_dt]
+
+# Define the ODE system
+def quarter_car_model_2(t, y):
+    z_F, v_F, z_R, v_R = y
+    dz_F_dt = v_F
+    dz_R_dt = v_R
+    dv_F_dt = (-c_F_2 * (z_F - z_R) - d_F_2 * (v_F - v_R)) / m_F
+    dv_R_dt = (c_F_2 * (z_F - z_R) + d_F_2 * (v_F - v_R) - c_R_2 * (z_R - z_S(t)) - d_R_2 * (v_R - z_S_dot(t))) / m_R
     return [dz_F_dt, dv_F_dt, dz_R_dt, dv_R_dt]
 
 class FCN(nn.Module):
@@ -151,6 +174,26 @@ class FCN(nn.Module):
         self.k.data.clamp_(min=0)
         self.d.data.clamp_(min=0)
 
+# Adaptive sampling function
+def adaptive_sampling(time, displacement, threshold=0.1, max_interval=0.05):
+    adaptive_time = [time[0]]
+    adaptive_displacement = [displacement[0]]
+    last_sample_time = time[0]
+
+    for i in range(1, len(time) - 1):
+        rate_of_change = abs(displacement[i + 1] - displacement[i - 1]) / (time[i + 1] - time[i - 1])
+        if rate_of_change > threshold or (time[i] - last_sample_time) >= max_interval:
+            adaptive_time.append(time[i])
+            adaptive_displacement.append(displacement[i])
+            last_sample_time = time[i]
+
+    adaptive_time.append(time[-1])
+    adaptive_displacement.append(displacement[-1])
+
+    return np.array(adaptive_time), np.array(adaptive_displacement)
+
+
+
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -160,9 +203,17 @@ print(f"Using device: {device}")
 m_F = 537  # kg, mass of the body
 m_R = 68    # kg, mass of the tire
 c_F = 41332  # N/m, stiffness of the chasis
-d_F = 5200   # Ns/m, damping of the chasis
+d_F = 1224   # Ns/m, damping of the chasis
 c_R = 365834  # N/m, stiffness of the tire
 d_R = 80    # Ns/m, damping of the tire
+
+c_F_2 = 57368  # N/m, stiffness of the chasis
+d_F_2 = 8000  # Ns/m, damping of the chasis
+c_R_2 = 365834  # N/m, stiffness of the tire
+d_R_2 = 80    # Ns/m, damping of the tire
+
+
+
 
 # Initial conditions: [z_BO, v_BO, z_T, v_T]
 y0 = [0.1, 0, 0.1, 0]
@@ -173,6 +224,7 @@ t = np.linspace(0, 6, 600)
 
 # Solve the ODE
 sol = solve_ivp(quarter_car_model, t_span, y0, t_eval=t)
+sol_2 = solve_ivp(quarter_car_model_2, t_span, y0, t_eval=t)
 
 # Extract the solution
 z_F = sol.y[0]
@@ -181,9 +233,20 @@ z_R = sol.y[2]
 v_R = sol.y[3]
 t = sol.t
 
+# Extract the solution
+z_F_2 = sol_2.y[0]
+v_F_2 = sol_2.y[1]
+z_R_2 = sol_2.y[2]
+v_R_2 = sol_2.y[3]
+t = sol.t
+
 # Compute accelerations
 a_F = np.gradient(v_F, t)
 a_R = np.gradient(v_R, t)
+
+# Compute accelerations
+a_F_2 = np.gradient(v_F_2, t)
+a_R_2 = np.gradient(v_R_2, t)
 
 # Compute the step input
 z_S_vals = np.array([z_S(ti) for ti in t])
@@ -193,9 +256,11 @@ plt.figure(figsize=(12, 10))
 
 # Plot road input and displacements in the same figure
 plt.subplot(3, 1, 1)
-plt.plot(t, z_S_vals, label='Road Input $z_S(t)$')
-plt.plot(t, z_F, label='$z_{F}(t)$ - Displacement of Car Body')
-plt.plot(t, z_R, label='$z_R(t)$ - Displacement of Tire')
+plt.plot(t, z_S_vals, color='lightgrey', label='Road Input $z_S(t)$')
+plt.plot(t, z_F, color='red', label='$z_{F}(t)$ - Displacement of Car Body BMW', linewidth=2)
+plt.plot(t, z_R, color='lightgrey', label='$z_R(t)$ - Displacement of Tire BMW')
+plt.plot(t, z_F_2, color='blue', label='$z_{F}(t)$ - Displacement of Car Body Opt', linewidth=2)
+plt.plot(t, z_R_2, color='lightgrey', label='$z_R(t)$ - Displacement of Tire Opt')
 plt.xlabel('Time (s)')
 plt.ylabel('Displacement (m)')
 plt.title('Road Input and Displacement Responses')
@@ -204,8 +269,10 @@ plt.grid(True)
 
 # Plot velocities
 plt.subplot(3, 1, 2)
-plt.plot(t, v_F, label='$v_{F}(t)$ - Velocity of Car Body')
-plt.plot(t, v_R, label='$v_R(t)$ - Velocity of Tire')
+plt.plot(t, v_F, color='red',label='$v_{F}(t)$ - Velocity of Car Body BMW')
+plt.plot(t, v_R, color='lightgrey',label='$v_R(t)$ - Velocity of Tire BMW')
+plt.plot(t, v_F_2,color='blue', label='$v_{F}(t)$ - Velocity of Car Body Opt')
+plt.plot(t, v_R_2, color='lightgrey',label='$v_R(t)$ - Velocity of Tire Opt')
 plt.xlabel('Time (s)')
 plt.ylabel('Velocity (m/s)')
 plt.title('Velocity Responses')
@@ -214,8 +281,10 @@ plt.grid(True)
 
 # Plot accelerations
 plt.subplot(3, 1, 3)
-plt.plot(t, a_F, label='$a_{F}(t)$ - Acceleration of Car Body')
-plt.plot(t, a_R, label='$a_R(t)$ - Acceleration of Tire')
+plt.plot(t, a_F,color='red', label='$a_{F}(t)$ - Acceleration of Car Body BMW')
+plt.plot(t, a_R, color='lightgrey',label='$a_R(t)$ - Acceleration of Tire BMW')
+plt.plot(t, a_F_2,color='blue', label='$a_{F}(t)$ - Acceleration of Car Body Opt')
+plt.plot(t, a_R_2, color='lightgrey',label='$a_R(t)$ - Acceleration of Tire Opt')
 plt.xlabel('Time (s)')
 plt.ylabel('Acceleration (m/s²)')
 plt.title('Acceleration Responses')
@@ -241,6 +310,19 @@ print(f"Estimated k: {init_k}")
 print(f"Estimated d: {init_d}")
 
 
+# Apply adaptive sampling
+adaptive_time, adaptive_displacement = adaptive_sampling(t, z_F, threshold=0.05)
+
+# Plot results
+plt.figure(figsize=(12, 6))
+plt.plot(t, z_F, label='Original Data')
+plt.scatter(adaptive_time, adaptive_displacement, color='red', label='Adaptive Sampling', s=10)
+plt.xlabel('Time')
+plt.ylabel('Displacement')
+plt.title('Adaptive Sampling of Harmonic Oscillator')
+plt.legend()
+plt.show()
+
 # Sample the whole curve
 x_data = x[0:600:10]
 y_data = y[0:600:10]
@@ -257,10 +339,12 @@ plt.scatter(x_data.cpu(), y_data.cpu(), color="tab:orange", label="Training data
 plt.legend()
 plt.show()
 
-x_physics = torch.linspace(0, 6, 60).view(-1, 1).to(device).requires_grad_(True)  # Sample locations over the problem domain
+#x_physics = torch.linspace(0, 6, 60).view(-1, 1).to(device).requires_grad_(True)  # Sample locations over the problem domain
+x_physics = torch.tensor(adaptive_time, requires_grad=True, dtype=torch.float32).view(-1,1).to(device)
+
 
 torch.manual_seed(123)
-model = FCN(1, 1, 50, 3, init_k, init_d).to(device)
+model = FCN(1, 1, 300, 3, init_k, init_d).to(device)
 initial_lr = 1e-3
 #target_lr = 1e-4
 #update_interval = 5000
@@ -269,7 +353,7 @@ optimizer = torch.optim.Adam([
     {'params': [param for name, param in model.named_parameters() if name not in ['k', 'd']]},
     {'params': [model.k, model.d]}], lr=initial_lr)
 #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=update_interval, gamma=gamma)
-EPOCH = 30000
+EPOCH = 20000
 
 
 pde_loss_history = []
@@ -298,6 +382,7 @@ for i in range(EPOCH):
     physics = dx2 + (model.d / m) * dx + (model.k / m) * yhp  # Computes the residual of the 1D harmonic oscillator differential equation
     loss2 = torch.mean(physics ** 2)
 
+    #vh = torch.autograd.grad(yh, x_data, torch.ones_like(yh), create_graph=True)[0]  # Computes dy/dx (velocity)
     #loss3 = torch.mean((vh - v_data) ** 2)
 
     # Backpropagate joint loss

@@ -22,44 +22,16 @@ device_index = 0  # Change this if you have multiple GPUs
 handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
 
 
-class FCN(nn.Module):
-    "Defines a fully connected network with learnable k and d parameters"
-    def __init__(self, N_INPUT, N_OUTPUT, N_HIDDEN, N_LAYERS, init_k, init_d):
-        super().__init__()
-        activation = nn.Tanh
-        self.fcs = nn.Sequential(
-            nn.Linear(N_INPUT, N_HIDDEN),
-            activation()
-        )
-        self.fch = nn.Sequential(
-            *[nn.Sequential(nn.Linear(N_HIDDEN, N_HIDDEN), activation()) for _ in range(N_LAYERS - 1)]
-        )
-        self.fce = nn.Linear(N_HIDDEN, N_OUTPUT)
-        self.k = nn.Parameter(torch.tensor(init_k))  # Initialize k
-        self.d = nn.Parameter(torch.tensor(init_d))  # Initialize d
-
-    def forward(self, x):
-        x = self.fcs(x)
-        x = self.fch(x)
-        x = self.fce(x)
-        return x
-
-    def enforce_non_negative(self):
-        self.k.data.clamp_(min=0)
-        self.d.data.clamp_(min=0)
-
 def generate_parameter_combinations(c_F_values, d_F_values, c_R_values, d_R_values):
     return list(itertools.product(c_F_values, d_F_values, c_R_values, d_R_values))
 
 def mass_spring_damper(state, t, m, d, k):
-
     x, v = state  # unpack the state vector
     dxdt = v  # derivative of x is velocity
     dvdt = (-d * v - k * x) / m  # derivative of v is acceleration
     return [dxdt, dvdt]
 
 def solve_harmonic_oscillator(m, d, k, x0, v0, t):
-
     initial_state = [x0, v0]
     states = odeint(mass_spring_damper, initial_state, t, args=(m, d, k))
     return states[:, 0], states[:, 1]
@@ -79,7 +51,8 @@ def plot_result(x, y, x_data, y_data, yh, xp=None):
     plt.plot(x.cpu(), yh.cpu(), color="tab:blue", linewidth=4, alpha=0.8, label="Neural network prediction")
     plt.scatter(x_data.cpu(), y_data.cpu(), s=60, color="tab:orange", alpha=0.4, label='Training data')
     if xp is not None:
-        plt.scatter(xp.cpu(), -0 * torch.ones_like(xp.cpu()), s=60, color="tab:green", alpha=0.4, label='Physics loss training locations')
+        plt.scatter(xp.cpu(), -0 * torch.ones_like(xp.cpu()), s=60, color="tab:green", alpha=0.4,
+                    label='Physics loss training locations')
     l = plt.legend(loc=(1.01, 0.34), frameon=False, fontsize="large")
     plt.setp(l.get_texts(), color="k")
     plt.xlim(-0.05, 6.05)
@@ -123,9 +96,9 @@ def estimate_k_d(t, y, m):
     return k, d
 
 def calculate_damping_quality_kpi(k, d, m):
-    eigenfrequency = np.sqrt(k / m) / (2 * np.pi) #Eigenfrequenz
-    damping_ratio = d / (2 * np.sqrt(k * m)) #Dämpfungsgrad
-    quality_factor = 1 / (2 * damping_ratio) #Gütefaktor
+    eigenfrequency = np.sqrt(k / m) / (2 * np.pi)  # Eigenfrequenz
+    damping_ratio = d / (2 * np.sqrt(k * m))  # Dämpfungsgrad
+    quality_factor = 1 / (2 * damping_ratio)  # Gütefaktor
     return eigenfrequency, damping_ratio, quality_factor
 
 def adaptive_sampling(time, displacement, threshold=0.1, max_interval=0.1):
@@ -145,158 +118,49 @@ def adaptive_sampling(time, displacement, threshold=0.1, max_interval=0.1):
 
     return np.array(adaptive_time), np.array(adaptive_displacement)
 
-def train_nn(x_data, y_data, x_physics, epochs=20000):
-
-    pde_loss_history = []
-    velocity_loss_history = []
-    data_loss_history = []
-    total_loss_history = []
-
-    for epoch in range(epochs):
-        optimizer.zero_grad()
-        yh = model(x_data)
-        loss1 = torch.mean((yh - y_data) ** 2)
-
-        yhp = model(x_physics)
-        dx = torch.autograd.grad(yhp, x_physics, torch.ones_like(yhp), create_graph=True)[0]
-        dx2 = torch.autograd.grad(dx, x_physics, torch.ones_like(dx), create_graph=True)[0]
-        physics = dx2 + (model.d / m) * dx + (model.k / m) * yhp
-        loss2 = torch.mean(physics ** 2)
-
-        # Compute the "velocity loss"
-        #dx_data = torch.autograd.grad(yh, x_data, torch.ones_like(yh), create_graph=True)[0]  # Computes dy/dx (velocity)
-        #loss3 = torch.mean((dx_data - v_data) ** 2)  # Use mean squared error for velocity loss
-
-        loss = loss1 + (1e-4) * loss2
-        loss.backward()
-        optimizer.step()
-
-        # Enforce non-negative constraints on k and d
-        model.enforce_non_negative()
-
-        # Store the loss values
-        pde_loss_history.append(loss2.item())
-        data_loss_history.append(loss1.item())
-        total_loss_history.append(loss.item())
-
-        # Plot the result as training progresses
-        if (epoch + 1) % 500 == 0:
-            print(
-                f"Epoch: {epoch + 1}\tTotal Loss: {loss.item()}\tPhysics Loss: {loss2.item()}\t"
-                f"Data Loss: {loss1.item()}\t"
-                f"k: {model.k.item()}\td: {model.d.item()}"
-            )
-            print("Current Learning Rate:", optimizer.param_groups[0]['lr'])
-
-
-    # Plot the loss history
-    plt.figure(figsize=(10, 6))
-    plt.plot(pde_loss_history, label='PDE Loss')
-    plt.plot(data_loss_history, label='Data Loss')
-    plt.plot(velocity_loss_history, label='Velocity Loss')
-    plt.plot(total_loss_history, label='Overall Loss', linestyle='--')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Loss History')
-    plt.legend()
-    plt.grid(True)
-    #plt.show()
-
-    #Plot the solution of the harmonic oscillator using learned k and d
-    with torch.no_grad():
-        learned_k = model.k.item()
-        learned_d = model.d.item()
-
-    # Initial conditions
-    x0 = 0.1  # initial displacement in meters
-    v0 = 0.0  # initial velocity in m/s
-
-    # Time array
-    t = np.linspace(0, 6, 600)  # 10 seconds, 250 points
-
-    # Solve
-    x_t, v_t = solve_harmonic_oscillator(m, learned_d, learned_k, x0, v0, t)
-
-    # Plotting
-    plt.figure(figsize=(12, 6))
-    plt.subplot(211)
-    plt.plot(x.cpu(), y.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
-    plt.plot(t, x_t, 'b', label='Displacement (x)')
-    plt.title('Displacement and Velocity Over Time')
-    plt.ylabel('Displacement (m)')
-    plt.legend(loc='best')
-
-    plt.subplot(212)
-    plt.plot(x.cpu(), v.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
-    plt.plot(t, v_t, 'r', label='Velocity (v)')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Velocity (m/s)')
-    plt.legend(loc='best')
-    plt.tight_layout()
-    file = "plots_pinn1d_Viertelfahrzeugmodel_Training/training_result_pinn_%i.png" % (i + 1)
-    plt.savefig(file)
-    #plt.show()
-
-    return model.k.item(), model.d.item()
-
-
 # Example harmonic oscillator data
 def harmonic_oscillator(t, A=1, omega=1, phase=0):
     return A * np.sin(omega * t + phase)
 
 
-
-
-# Generate synthetic dataset
-time = np.linspace(0, 10, 1000)  # Original high-resolution time points
-displacement = harmonic_oscillator(time)
-
-
 # Main process
-c_F_values = [30000, 40000, 50000]  # Example values for chassis stiffness
-d_F_values = [1000, 5000, 10000]     # Example values for chassis damping
-c_R_values = [200000, 250000, 300000]  # Example values for tire stiffness
-d_R_values = [50, 75, 100]             # Example values for tire damping
+c_F_values = np.linspace(10000, 100000, 5)  # Example values for chassis stiffness
+d_F_values = np.linspace(500, 10000, 5)  # Example values for chassis damping
+c_R_values = np.linspace(100000, 500000, 5)  # Example values for tire stiffness
+d_R_values = np.linspace(10, 250, 5) # Example values for tire damping
 
 combinations = generate_parameter_combinations(c_F_values, d_F_values, c_R_values, d_R_values)
 
-# Load the parameter combinations from the CSV file
-selected_combinations = []
-with open('selected_combinations.csv', 'r') as file:
-    reader = csv.reader(file)
-    next(reader)  # Skip header
-    for row in reader:
-        selected_combinations.append((float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4])))
-
-
 start = tm.time()
 
-#for i, combination in enumerate(selected_combinations):
+# for i, combination in enumerate(selected_combinations):
 for i, combination in enumerate(combinations):
-    #c_F, d_F, eigenfrequency, damping_ratio, quality_factor = combination
+    # c_F, d_F, eigenfrequency, damping_ratio, quality_factor = combination
     c_F, d_F, c_R, d_R = combination
-    #print(f"Training with parameters: c_F={c_F}, d_F={d_F}, eigenfrequency={eigenfrequency}, damping_ratio={damping_ratio}, quality_factor={quality_factor}")
+    # print(f"Training with parameters: c_F={c_F}, d_F={d_F}, eigenfrequency={eigenfrequency}, damping_ratio={damping_ratio}, quality_factor={quality_factor}")
     print(f"Dataset {i + 1}/{len(combinations)} in progress...")
 
-    #The parameters of tyre are constant
-    #c_R = 365834  # N/m, stiffness of the tire
-    #d_R = 80  # Ns/m, damping of the tire
+    # The parameters of tyre are constant
+    # c_R = 365834  # N/m, stiffness of the tire
+    # d_R = 80  # Ns/m, damping of the tire
 
     print(
         f"c_F: {c_F}\td_F: {d_F}\t"
         f"c_R: {c_R}\td_R: {d_R}\t"
     )
 
-    csv_file_path = 'Dataset_BMW_KPI.csv'
+    csv_file_path = 'Dataset_BMW_KPI_CurveFitting.csv'
 
 
     # Define the road input (hole of -0.1 meter)
     def z_S(t):
         return 0
 
+
     # Derivative of road input
     def z_S_dot(t):
         return 0  # Assuming a step input for simplicity
+
 
     # Define the ODE system
     def quarter_car_model(t, y):
@@ -317,15 +181,14 @@ for i, combination in enumerate(combinations):
 
     # Parameters
     m = 1  # kg, mass of the body
-    
+
     # Parameters
     m_F = 537  # kg, mass of the body
     m_R = 68  # kg, mass of the tire
     c_F = c_F  # N/m, stiffness of the chasis
     d_F = d_F  # Ns/m, damping of the chasis
     c_R = c_R  # N/m, stiffness of the tire
-    d_R = d_R # Ns/m, damping of the tire
-
+    d_R = d_R  # Ns/m, damping of the tire
 
     # Solve the ODE
     sol = solve_ivp(quarter_car_model, t_span, y0, t_eval=t)
@@ -379,7 +242,7 @@ for i, combination in enumerate(combinations):
     plt.grid(True)
 
     plt.tight_layout()
-    #plt.show()
+    # plt.show()
 
     t = np.linspace(0, 6, 600)
     x = torch.tensor(t[0:600:1], dtype=torch.float32).view(-1, 1).to(device)
@@ -387,40 +250,49 @@ for i, combination in enumerate(combinations):
     v = torch.tensor(v_F[0:600:1], dtype=torch.float32).view(-1, 1).to(device)
 
     # Estimate initial k and d
-    init_k, init_d = estimate_k_d(t, y, m)
-    print(f"Estimated k: {init_k}")
-    print(f"Estimated d: {init_d}")
+    k_1d, d_1d = estimate_k_d(t, y, m)
+    print(f"Estimated k: {k_1d}")
+    print(f"Estimated d: {d_1d}")
 
-    # Sample the whole curve
-    x_data = x[0:600:10]
-    y_data = y[0:600:10]
-    v_data = v[0:600:10]
-
-    x_physics = torch.linspace(0, 6, 60).view(-1, 1).to(device).requires_grad_(True)
-
-    plt.figure()
-    plt.plot(x.cpu(), y.cpu(), label="Exact solution")
-    plt.scatter(x_data.cpu(), y_data.cpu(), color="tab:orange", label="Training data")
-    plt.legend()
-    #plt.show()
-
-    model = FCN(1, 1, 400, 4, init_k, init_d).to(device)
-    initial_lr = 1e-3
-    optimizer = torch.optim.Adam([
-        {'params': [param for name, param in model.named_parameters() if name not in ['k', 'd']]},
-        {'params': [model.k, model.d]}], lr=initial_lr)
-
-    # Train the neural network
-    learned_k, learned_d = train_nn(x_data, y_data, x_physics)
 
     # Calculate the damping quality KPI
-    eigenfrequency, damping_ratio, quality_factor = calculate_damping_quality_kpi(learned_k, learned_d, m)
+    eigenfrequency, damping_ratio, quality_factor = calculate_damping_quality_kpi(k_1d, d_1d, m)
 
     print(
         f"Eigenfrequency: {eigenfrequency}\tDamping ratio: {damping_ratio}\t"
         f"Quality factor: {quality_factor}\t"
     )
 
+
+    # Time array
+    t = np.linspace(0, 6, 600)  # 10 seconds, 250 points
+
+    # Initial conditions
+    x0 = 0.1  # initial displacement in meters
+    v0 = 0.0  # initial velocity in m/s
+
+    # Solve
+    x_t, v_t = solve_harmonic_oscillator(m, d_1d, k_1d, x0, v0, t)
+
+    # Plotting
+    plt.figure(figsize=(12, 6))
+    plt.subplot(211)
+    plt.plot(x.cpu(), y.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
+    plt.plot(t, x_t, 'b', label='Displacement (x)')
+    plt.title('Displacement and Velocity Over Time')
+    plt.ylabel('Displacement (m)')
+    plt.legend(loc='best')
+
+    plt.subplot(212)
+    plt.plot(x.cpu(), v.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
+    plt.plot(t, v_t, 'r', label='Velocity (v)')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Velocity (m/s)')
+    plt.legend(loc='best')
+    plt.tight_layout()
+    file = "plots_pinn1d_Viertelfahrzeugmodel_Training_CurveFitting/training_result_pinn_%i.png" % (i + 1)
+    plt.savefig(file)
+    # plt.show()
 
     # Save the results to the CSV file
     results = [c_F, d_F, c_R, d_R, eigenfrequency, damping_ratio, quality_factor]
