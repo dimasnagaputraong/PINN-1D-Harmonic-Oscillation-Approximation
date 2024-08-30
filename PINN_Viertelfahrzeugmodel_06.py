@@ -23,26 +23,43 @@ pynvml.nvmlInit()
 device_index = 0  # Change this if you have multiple GPUs
 handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
 
+import torch
+import torch.nn as nn
+
 
 class FCN(nn.Module):
     "Defines a fully connected network with learnable k and d parameters"
 
-    def __init__(self, N_INPUT, N_OUTPUT, N_HIDDEN, N_LAYERS, init_k, init_d):
+    def __init__(self, N_INPUT, N_OUTPUT, hidden_layers, init_k, init_d):
+        """
+        Args:
+        - N_INPUT: Number of input features.
+        - N_OUTPUT: Number of output features.
+        - hidden_layers: List of integers where each integer defines the number of neurons in that hidden layer.
+        - init_k: Initial value for the stiffness constant (k).
+        - init_d: Initial value for the damping constant (d).
+        """
+
         super().__init__()
         activation = nn.Tanh
-        self.fcs = nn.Sequential(
-            nn.Linear(N_INPUT, N_HIDDEN),
-            activation()
-        )
-        self.fch = nn.Sequential(
-            *[nn.Sequential(nn.Linear(N_HIDDEN, N_HIDDEN), activation()) for _ in range(N_LAYERS - 1)]
-        )
-        self.fce = nn.Linear(N_HIDDEN, N_OUTPUT)
-        self.k = nn.Parameter(torch.tensor(init_k))  # Initialize k
-        self.d = nn.Parameter(torch.tensor(init_d))  # Initialize d
+
+        # Define the input layer
+        layers = [nn.Linear(N_INPUT, hidden_layers[0]), activation()]
+
+        for i in range(1, len(hidden_layers)):
+            layers.append(nn.Linear(hidden_layers[i - 1], hidden_layers[i]))
+            layers.append(activation())
+
+        self.fch = nn.Sequential(*layers)
+
+        # Define the output layer
+        self.fce = nn.Linear(hidden_layers[-1], N_OUTPUT)
+
+        # Initialize k and d parameters
+        self.k = nn.Parameter(torch.tensor(init_k, dtype=torch.float32))  # Initialize k
+        self.d = nn.Parameter(torch.tensor(init_d, dtype=torch.float32))  # Initialize d
 
     def forward(self, x):
-        x = self.fcs(x)
         x = self.fch(x)
         x = self.fce(x)
         return x
@@ -52,9 +69,6 @@ class FCN(nn.Module):
         self.d.data.clamp_(min=0)
 
 
-def generate_parameter_combinations(c_F_values, d_F_values, c_R_values, d_R_values):
-    return list(itertools.product(c_F_values, d_F_values, c_R_values, d_R_values))
-
 
 def mass_spring_damper(state, t, m, d, k):
     x, v = state  # unpack the state vector
@@ -62,10 +76,7 @@ def mass_spring_damper(state, t, m, d, k):
     dvdt = (-d * v - k * x) / m  # derivative of v is acceleration
     return [dxdt, dvdt]
 
-
-
-
-# Function to solve the harmonic oscillator
+# Function to solve the 1D harmonic oscillator
 def solve_harmonic_oscillator(m, d, k, x0, v0, t):
     initial_state = [x0, v0]
     states = odeint(mass_spring_damper, initial_state, t, args=(m, d, k))
@@ -79,43 +90,16 @@ def solve_harmonic_oscillator(m, d, k, x0, v0, t):
 
     return position, velocity, acceleration
 
-
-def save_gif_PIL(outfile, files, fps=5, loop=0):
-    "Helper function for saving GIFs"
-    imgs = [Image.open(file) for file in files]
-    imgs[0].save(fp=outfile, format='GIF', append_images=imgs[1:], save_all=True, duration=int(1000 / fps), loop=loop)
-
-
 def squared_difference(input, target):
     return (input - target) ** 2
 
-
-def plot_result(x, y, x_data, y_data, yh, xp=None):
-    "Pretty plot training results"
-    plt.figure(figsize=(8, 4))
-    plt.plot(x.cpu(), y.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
-    plt.plot(x.cpu(), yh.cpu(), color="tab:blue", linewidth=4, alpha=0.8, label="Neural network prediction")
-    plt.scatter(x_data.cpu(), y_data.cpu(), s=60, color="tab:orange", alpha=0.4, label='Training data')
-    if xp is not None:
-        plt.scatter(xp.cpu(), -0 * torch.ones_like(xp.cpu()), s=60, color="tab:green", alpha=0.4,
-                    label='Physics loss training locations')
-    l = plt.legend(loc=(1.01, 0.34), frameon=False, fontsize="large")
-    plt.setp(l.get_texts(), color="k")
-    plt.xlim(-0.05, 6.05)
-    plt.ylim(-0.5, 0.5)
-    plt.text(1.065, 0.7, "Training step: %i" % (i + 1), fontsize="xx-large", color="k")
-    plt.axis("off")
-
-
-# Save results to CSV
 def save_results_to_csv(file_path, results):
     with open(file_path, 'a', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(results)
 
-
 def estimate_k_d(t, y, m):
-    # Ensure y is a numpy array for easier manipulation
+
     y = y.cpu().numpy().flatten()
 
     def damped_oscillator(t, A, B, omega_n, zeta):
@@ -143,31 +127,11 @@ def estimate_k_d(t, y, m):
 
     return k, d
 
-
 def calculate_damping_quality_kpi(k, d, m):
     eigenfrequency = np.sqrt(k / m) / (2 * np.pi)  # Eigenfrequenz
     damping_ratio = d / (2 * np.sqrt(k * m))  # Dämpfungsgrad
     quality_factor = 1 / (2 * damping_ratio)  # Gütefaktor
     return eigenfrequency, damping_ratio, quality_factor
-
-
-def adaptive_sampling(time, displacement, threshold=0.1, max_interval=0.1):
-    adaptive_time = [time[0]]
-    adaptive_displacement = [displacement[0]]
-    last_sample_time = time[0]
-
-    for i in range(1, len(time) - 1):
-        rate_of_change = abs(displacement[i + 1] - displacement[i - 1]) / (time[i + 1] - time[i - 1])
-        if rate_of_change > threshold or (time[i] - last_sample_time) >= max_interval:
-            adaptive_time.append(time[i])
-            adaptive_displacement.append(displacement[i])
-            last_sample_time = time[i]
-
-    adaptive_time.append(time[-1])
-    adaptive_displacement.append(displacement[-1])
-
-    return np.array(adaptive_time), np.array(adaptive_displacement)
-
 
 def train_nn(x_data, y_data, x_physics, epochs=20000):
     pde_loss_history = []
@@ -186,7 +150,7 @@ def train_nn(x_data, y_data, x_physics, epochs=20000):
         physics = dx2 + (model.d / m) * dx + (model.k / m) * yhp
         loss2 = torch.mean(physics ** 2)
 
-        # Compute the "velocity loss"
+        # Compute the velocity loss
         # dx_data = torch.autograd.grad(yh, x_data, torch.ones_like(yh), create_graph=True)[0]  # Computes dy/dx (velocity)
         # loss3 = torch.mean((dx_data - v_data) ** 2)  # Use mean squared error for velocity loss
 
@@ -224,7 +188,7 @@ def train_nn(x_data, y_data, x_physics, epochs=20000):
     plt.grid(True)
     # plt.show()
 
-    # Plot the solution of the harmonic oscillator using learned k and d
+
     with torch.no_grad():
         learned_k = model.k.item()
         learned_d = model.d.item()
@@ -272,21 +236,33 @@ def train_nn(x_data, y_data, x_physics, epochs=20000):
     return model.k.item(), model.d.item(), rms_acceleration
 
 
-# Example harmonic oscillator data
-def harmonic_oscillator(t, A=1, omega=1, phase=0):
-    return A * np.sin(omega * t + phase)
+def plot_result(x, y, x_data, y_data, yh, xp=None):
+    plt.figure(figsize=(8, 4))
+    plt.plot(x.cpu(), y.cpu(), color="grey", linewidth=2, alpha=0.8, label="Exact solution")
+    plt.plot(x.cpu(), yh.cpu(), color="tab:blue", linewidth=4, alpha=0.8, label="Neural network prediction")
+    plt.scatter(x_data.cpu(), y_data.cpu(), s=60, color="tab:orange", alpha=0.4, label='Training data')
+    if xp is not None:
+        plt.scatter(xp.cpu(), -0 * torch.ones_like(xp.cpu()), s=60, color="tab:green", alpha=0.4,
+                    label='Physics loss training locations')
+    l = plt.legend(loc=(1.01, 0.34), frameon=False, fontsize="large")
+    plt.setp(l.get_texts(), color="k")
+    plt.xlim(-0.05, 6.05)
+    plt.ylim(-0.5, 0.5)
+    plt.text(1.065, 0.7, "Training step: %i" % (i + 1), fontsize="xx-large", color="k")
+    plt.axis("off")
+
+def save_gif_PIL(outfile, files, fps=5, loop=0):
+    "Helper function for saving GIFs"
+    imgs = [Image.open(file) for file in files]
+    imgs[0].save(fp=outfile, format='GIF', append_images=imgs[1:], save_all=True, duration=int(1000 / fps), loop=loop)
 
 
-# Generate synthetic dataset
-time = np.linspace(0, 10, 1000)  # Original high-resolution time points
-displacement = harmonic_oscillator(time)
 
 # Define parameter ranges
-# Main process
-c_F_values = np.linspace(10000, 100000, 10)  # Example values for chassis stiffness
-d_F_values = np.linspace(500, 20000, 10)  # Example values for chassis damping
-c_R_values = np.linspace(100000, 500000, 10)  # Example values for tire stiffness
-d_R_values = np.linspace(10, 500, 10) # Example values for tire damping
+c_F_values = np.linspace(10000, 100000, 10)  # Design space for chassis stiffness
+d_F_values = np.linspace(500, 20000, 10)  # Design space for chassis damping
+c_R_values = np.linspace(100000, 500000, 10)  # Design space for tyre stiffness
+d_R_values = np.linspace(10, 1000, 10) # Design space for tyre damping
 
 
 # Number of samples and parameters
@@ -308,11 +284,12 @@ print(scaled_samples)
 
 start = tm.time()
 
-# for i, combination in enumerate(selected_combinations):
+
 for i, combination in enumerate(scaled_samples):
-    # c_F, d_F, eigenfrequency, damping_ratio, quality_factor = combination
+    "#Iterate through the list of combination, generate 2D dataset for each, and train the the PINN accordingly to derive the 1D KPI accordingly"
+
     c_F, d_F, c_R, d_R = combination
-    # print(f"Training with parameters: c_F={c_F}, d_F={d_F}, eigenfrequency={eigenfrequency}, damping_ratio={damping_ratio}, quality_factor={quality_factor}")
+
     print(f"Dataset {i + 1}/{len(scaled_samples)} in progress...")
 
     print(
@@ -322,16 +299,13 @@ for i, combination in enumerate(scaled_samples):
 
     csv_file_path = 'Dataset_BMW_KPI_LHS.csv'
 
-
     # Define the road input (hole of -0.1 meter)
     def z_S(t):
         return 0
 
-
     # Derivative of road input
     def z_S_dot(t):
         return 0  # Assuming a step input for simplicity
-
 
     # Define the ODE system
     def quarter_car_model(t, y):
@@ -361,7 +335,7 @@ for i, combination in enumerate(scaled_samples):
     c_R = c_R  # N/m, stiffness of the tire
     d_R = d_R  # Ns/m, damping of the tire
 
-    # Solve the ODE
+    # Solve the 2D ODE
     sol = solve_ivp(quarter_car_model, t_span, y0, t_eval=t)
 
     # Extract the solution
@@ -440,7 +414,8 @@ for i, combination in enumerate(scaled_samples):
     plt.legend()
     # plt.show()
 
-    model = FCN(1, 1, 400, 4, init_k, init_d).to(device)
+    #model = FCN(1, 1, 400, 4, init_k, init_d).to(device)
+    model = FCN(N_INPUT=1, N_OUTPUT=1, hidden_layers=[128, 128, 128, 128], init_k=init_k, init_d=init_d).to(device)
     initial_lr = 1e-3
     optimizer = torch.optim.Adam([
         {'params': [param for name, param in model.named_parameters() if name not in ['k', 'd']]},
